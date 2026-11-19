@@ -9,13 +9,13 @@ desktop app).
 
 ## 1. What you need
 
-| Tool                               | Why                                                     | Check              |
-| ---------------------------------- | ------------------------------------------------------- | ------------------ |
-| [Bun](https://bun.sh) 1.4 or later | runs everything                                         | `bun --version`    |
-| tmux                               | the CLI runtime runs each Claude Code session in a pane | `tmux -V`          |
-| Claude Code, logged in             | the agent itself                                        | `claude --version` |
-| git                                | worktrees, the memory repo                              | `git --version`    |
-| `gh` logged in, `jq` (for Today)   | the board's GitHub sources                              | `gh auth status`   |
+| Tool                               | Why                                                     | Check            |
+| ---------------------------------- | ------------------------------------------------------- | ---------------- |
+| [Bun](https://bun.sh) 1.4 or later | runs everything                                         | `bun --version`  |
+| tmux                               | the CLI runtime runs each Claude Code session in a pane | `tmux -V`        |
+| Claude Code (native), logged in    | the agent itself                                        | `claude doctor`  |
+| git                                | worktrees, the memory repo                              | `git --version`  |
+| `gh` logged in, `jq` (for Today)   | the board's GitHub sources                              | `gh auth status` |
 
 A Linear API key is optional (Today can show your assigned issues). The Today desktop app (step 9) also needs Rust and
 Tauri's macOS prerequisites; nothing else does.
@@ -23,6 +23,15 @@ Tauri's macOS prerequisites; nothing else does.
 **The watchdog updates Claude Code.** Every time it starts (step 4), the watchdog runs `claude update` on the `claude`
 it finds on your PATH, so sessions get the newest CLI (`packages/watchdog/src/claude-update.ts`). If you pin your
 Claude Code version, start the watchdog with `ANIMA_SKIP_CLAUDE_UPDATE=true` in its environment.
+
+**Use the native install.** `claude update` only updates Claude Code's native install (`~/.local/bin/claude`). With
+a Homebrew or npm install, the watchdog logs `Claude CLI update check failed` and starts anyway, so the CLI quietly
+falls behind. Old versions break Anima in ways that are hard to trace: one tester on 2.1.267 found that sessions
+exited right after launch (that version rejects `--append-system-prompt` together with `--append-system-prompt-file`)
+and that prompts failed with "prompt too long" (that version turns off MCP tool search behind Anima's proxy, so every
+tool loads up front). `claude doctor` shows the install method (`Running: native (…)`). To switch, run
+`claude install latest`, then uninstall the old copy (`brew uninstall --cask claude-code` or
+`npm uninstall -g @anthropic-ai/claude-code`), so your shell and Anima run the same `claude`.
 
 ## 2. Install
 

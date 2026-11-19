@@ -51,6 +51,10 @@ hard limits.
 Needs macOS (Linux untested), [Bun](https://bun.sh) 1.4+, tmux, and a logged-in Claude Code. Today also wants `gh`
 (logged in) and `jq`.
 
+Use Claude Code's **native install** (`claude doctor` should say `Running: native`). The watchdog keeps it current with
+`claude update`, which can't update a Homebrew or npm install, and an old CLI breaks sessions in confusing ways. To
+switch, run `claude install latest`, then remove the old copy.
+
 ```bash
 git clone <your fork> ~/open-anima && cd ~/open-anima
 bun install
