@@ -1,0 +1,1757 @@
+/**
+ * NavigationDrawer — Codex-style sidebar.
+ *
+ * Layout (top to bottom):
+ *   FIXED TOP    — New workspace, New session, Search
+ *   TABS         — Active | Workspaces (Active by default)
+ *   SCROLL MID   — the selected tab: the ACTIVE queue, or the collapsible
+ *                  workspace tree, each workspace showing a page of sessions
+ *                  with a "Show more" toggle.
+ *   FIXED BOTTOM — Settings (popup menu)
+ *
+ * Per-workspace state (expanded, show-more) lives in this component because
+ * it's purely UI; persistent state (active workspace/session) flows down
+ * via props.
+ *
+ * Most of the menu actions and the Search modal are no-op stubs for now —
+ * the visual scaffold is in place so we can wire backend calls one at a
+ * time without touching the layout again.
+ */
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { groupNested, nestedLabel, splitBackground, type ActiveGroup } from "./active-pane-groups";
+import {
+  Bot,
+  Folder,
+  FolderOpen,
+  LogOut,
+  MoreHorizontal,
+  Pencil,
+  Pin,
+  PinOff,
+  Plus,
+  Puzzle,
+  RefreshCw,
+  Search,
+  Ticket,
+  GitPullRequest,
+  Settings as SettingsIcon,
+  SquarePlus,
+  MessageSquarePlus,
+  Trash2,
+  User,
+  Zap,
+  OctagonAlert,
+  CornerDownRight,
+  ChevronDown,
+  ChevronRight,
+  FolderTree,
+  GitBranch,
+  Loader2,
+} from "lucide-react";
+import {
+  DISPOSITION_PRESENTATION,
+  SessionMenu,
+  SessionTitleInput,
+  useClickOutside,
+} from "./SessionMenu";
+import type {
+  WorkspaceInfo,
+  SessionInfo,
+  SessionFolderInfo,
+  WorktreeSetupInfo,
+  SessionRefInfo,
+  SessionSearchHit,
+  SessionSearchResult,
+  SessionRuntimeStatus,
+  SessionDisposition,
+} from "../hooks/useChatGateway";
+
+// ── Props ───────────────────────────────────────────────────────
+
+export type WorkspaceMenuAction =
+  | "pin"
+  | "refresh"
+  | "openInFinder"
+  | "folders"
+  | "createWorktree"
+  | "rename"
+  | "archive"
+  | "remove";
+
+export type SettingsMenuAction = "settings" | "rateLimits" | "logout";
+
+interface NavigationDrawerProps {
+  workspaces: WorkspaceInfo[];
+  /** Sessions per workspace, keyed by `workspace.id`. Server-paginated. */
+  sessionsByWorkspace: Record<string, SessionInfo[]>;
+  /**
+   * Whether each workspace still has more sessions on the server, keyed by
+   * `workspace.id`. Drives the "Show more" affordance — hidden when false.
+   */
+  hasMoreByWorkspace?: Record<string, boolean>;
+  activeWorkspace: WorkspaceInfo | null;
+  activeSessionId: string | null;
+  isConnected: boolean;
+  onWorkspaceSelect: (workspace: WorkspaceInfo) => void;
+  onSessionSelect: (session: SessionInfo, workspace: WorkspaceInfo) => void;
+  /**
+   * Rename a session, or clear the rename with `null`. Optional: without it
+   * the pencil affordance simply doesn't render.
+   */
+  onRenameSession?: (session: SessionInfo, title: string | null) => Promise<void> | void;
+  /**
+   * Set where a session's work stands. Optional: without it the row's status
+   * menu doesn't render, which is what a minimal embedded drawer mounts.
+   */
+  onSetSessionDisposition?: (
+    session: SessionInfo,
+    disposition: SessionDisposition,
+  ) => Promise<void> | void;
+  /** Create a session in the given workspace (defaults to active when omitted). */
+  onNewSession: (workspace?: WorkspaceInfo) => void;
+  onNewWorkspace: () => void;
+  /**
+   * Open the new-session dialog (any workspace, title, worktree). Optional:
+   * without it the top action doesn't render.
+   */
+  onOpenNewSession?: () => void;
+  /** Fetch the next page of sessions for a workspace and append. */
+  onLoadMoreSessions?: (workspaceId: string) => Promise<void> | void;
+  /** ··· menu on a workspace row. Stub-friendly: caller can no-op. */
+  onWorkspaceMenuAction?: (action: WorkspaceMenuAction, workspace: WorkspaceInfo) => void;
+  /** Settings popup at the bottom. Stub-friendly. */
+  onSettingsMenuAction?: (action: SettingsMenuAction) => void;
+  /**
+   * Full-text search across every message in every workspace.
+   *
+   * Optional: without it the search box stays the local title filter it always
+   * was, which is what a minimal embedded drawer mounts.
+   */
+  onSearchSessions?: (query: string) => Promise<SessionSearchResult>;
+  /**
+   * Sessions for the ACTIVE pane above the tree — in flight, or finished and
+   * unacknowledged. Optional, like everything else here, so an embedded
+   * client can mount the drawer without the gateway plumbing behind it.
+   */
+  activeSessions?: ActiveSessionRow[];
+  /** Ticking clock for the pane's elapsed labels. */
+  activeNow?: number;
+  /** Mark a pane row done — it drops out of the pane and back into its tree. */
+  onAcknowledgeSession?: (sessionId: string) => void;
+  /** Pin or unpin a pane row. Without it the menu has no pin item. */
+  onPinSession?: (sessionId: string, pinned: boolean) => void;
+}
+
+/**
+ * One row in the ACTIVE pane.
+ *
+ * Carries its workspace as a *label* rather than sitting under a workspace
+ * parent: when something is happening, the workspace is context, not
+ * hierarchy. That's the whole reason this pane exists — the tree is the wrong
+ * shape for "what is going on right now", and collapsing a folder shouldn't
+ * be able to hide live work.
+ */
+export interface ActiveSessionRow {
+  sessionId: string;
+  workspaceId: string;
+  workspaceName: string;
+  title: string | null;
+  firstPrompt: string | null;
+  runtimeStatus: SessionRuntimeStatus;
+  disposition: SessionDisposition;
+  /** What the elapsed label counts from. */
+  waitingSince: string;
+  /** Pinned rows sort ahead of the rest. The server orders them. */
+  pinned: boolean;
+  /** Set on a subagent: the session that spawned it. Shown nested under it. */
+  parentSessionId?: string | null;
+  /**
+   * Who started it. An automated row nobody pinned, with no listed
+   * launcher to nest under, goes in the collapsed Background group.
+   */
+  origin?: "user" | "automated";
+  /**
+   * The session that launched this one (followed forward through handoffs by
+   * the server). Shown nested under it when that row is listed.
+   */
+  launchedBySessionId?: string | null;
+  /** Set when the session runs outside its workspace's root: a worktree, say. */
+  folder?: SessionFolderInfo;
+  /** Set while its worktree is being made (or failed to be). */
+  worktreeSetup?: WorktreeSetupInfo;
+}
+
+// ── Time formatting ─────────────────────────────────────────────
+
+function formatTimeAgo(dateStr: string): string {
+  if (!dateStr) return "";
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMins / 60);
+  const diffDays = Math.floor(diffHours / 24);
+  const diffWeeks = Math.floor(diffDays / 7);
+  const diffMonths = Math.floor(diffDays / 30);
+  if (diffMins < 1) return "now";
+  if (diffMins < 60) return `${diffMins}m`;
+  if (diffHours < 24) return `${diffHours}h`;
+  if (diffDays < 7) return `${diffDays}d`;
+  if (diffWeeks < 5) return `${diffWeeks}w`;
+  return `${diffMonths}mo`;
+}
+
+/** Cap on chips per row, so one busy session can't swamp the list. */
+const MAX_VISIBLE_REFS = 3;
+
+/** The derived name — what a session is called before anyone renames it. */
+function derivedSessionName(s: SessionInfo): string {
+  if (s.firstPrompt) return s.firstPrompt;
+  if (s.gitBranch) return s.gitBranch;
+  return s.sessionId.slice(0, 8);
+}
+
+function formatSessionName(s: SessionInfo): string {
+  return s.title?.trim() || derivedSessionName(s);
+}
+
+// ── Status presentation ─────────────────────────────────────────
+
+/**
+ * How each runtime status reads in the nav.
+ *
+ * The resting states are absent here and handled in `runtimePresentation`,
+ * because what they should show depends on the *other* axis.
+ *
+ * The original rule was that anything at rest showed nothing: most rows are at
+ * rest, and a column of identical dots costs the eye something on every scan
+ * while saying nothing. That reasoning was sound when a row's mark was
+ * optional and the ones without simply took less width. It stopped being sound
+ * once the mark got a fixed slot of its own — a resting row then reads as a
+ * *hole* in the column rather than an absence of news, which is worse than the
+ * uniform dot it was avoiding. And the dot isn't uniform anyway: the rows it
+ * appears on are exactly the open ones, so it says "still yours" against the
+ * resolved and archived rows that carry their own glyph.
+ */
+const RUNTIME_PRESENTATION: Partial<
+  Record<SessionRuntimeStatus, { dotClass: string; label: string; pulse?: boolean }>
+> = {
+  // Motion, not a colour change: a spinner reads as "busy" at a glance in a
+  // way a static dot doesn't, however brightly it pulses.
+  running: { dotClass: "spinner", label: "Working" },
+  awaiting_input: { dotClass: "bg-amber-500", label: "Waiting for you", pulse: true },
+  awaiting_approval: { dotClass: "bg-amber-500", label: "Waiting for approval", pulse: true },
+  failed: { dotClass: "bg-red-500", label: "Failed" },
+  interrupted: { dotClass: "bg-gray-400", label: "Interrupted" },
+  stalled: { dotClass: "bg-orange-500", label: "Stalled" },
+  api_error: { dotClass: "bg-red-500", label: "Stalled on an API error", pulse: true },
+};
+
+/** Finished, and nobody has said they've dealt with it. */
+const READY_PRESENTATION = { dotClass: "bg-blue-500", label: "Done — ready for you" };
+
+/** At rest, still open — nothing is happening and nobody has closed it out. */
+const OPEN_PRESENTATION = { dotClass: "bg-blue-500", label: "Open — nothing running" };
+
+/** Statuses that mean "not doing anything", including having never said. */
+function isAtRest(status?: SessionRuntimeStatus): boolean {
+  return status === undefined || status === "idle";
+}
+
+/**
+ * Dispositions that mean "I'm done with this", and therefore outrank whatever
+ * the machine axis last claimed.
+ *
+ * `runtime_status` is a cache of a live fact and can be stale — a turn whose
+ * ending never reached us leaves a row asserting `running` indefinitely. The
+ * server sweeps those, but a sweep is periodic and a human decision isn't: the
+ * moment you mark something resolved, showing it as busy contradicts you to
+ * your face. Deliberately not `blocked` or `needs_review` — those say
+ * something about the *work*, and a session doing something while flagged for
+ * review is a fact worth seeing.
+ */
+const SETTLED_DISPOSITIONS: readonly SessionDisposition[] = ["resolved", "archived"];
+
+function runtimePresentation(
+  status?: SessionRuntimeStatus,
+  disposition?: SessionDisposition,
+): { dotClass: string; label: string; pulse?: boolean } | undefined {
+  if (disposition && SETTLED_DISPOSITIONS.includes(disposition)) return undefined;
+  // A disposition other than `open` carries its own glyph and is the more
+  // useful of the two facts, so it takes the slot and the resting dot stands
+  // down. `open` has no glyph — this is the mark it gets.
+  const isOpen = (disposition ?? "open") === "open";
+  if (status === "completed") return isOpen ? READY_PRESENTATION : undefined;
+  if (isAtRest(status)) return isOpen ? OPEN_PRESENTATION : undefined;
+  return status ? RUNTIME_PRESENTATION[status] : undefined;
+}
+
+// ── ACTIVE pane ─────────────────────────────────────────────────
+
+function activeRowName(row: ActiveSessionRow): string {
+  return row.title?.trim() || row.firstPrompt?.trim() || row.sessionId.slice(0, 8);
+}
+
+function elapsedLabel(since: string, now: number): string {
+  const at = Date.parse(since);
+  if (!Number.isFinite(at)) return "";
+  const minutes = Math.floor((now - at) / 60_000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * The flat "what's happening right now" list, above the workspace tree.
+ *
+ * Ordered by the server, pinned first, then newest-created first, and
+ * rendered in exactly that order — nothing is re-sorted here. Two earlier
+ * rules both had to go for the same reason: ordering by recent activity moved
+ * a row you were reading because some *other* session finished, and hoisting
+ * the tab's own session to the top made every row jump each time you clicked
+ * through the list. Creation order never changes, so a session is always where
+ * you last saw it, which is the property that makes a list scannable at all.
+ * Pinning moves a row once, when the user asks, and never again.
+ *
+ * It has the sidebar's whole middle to itself now that it is a tab, so it
+ * shows every one of the user's rows and scrolls. Only automated sessions
+ * collapse behind a count, in the Background group at the bottom.
+ */
+function ActivePane({
+  rows,
+  activeSessionId,
+  now,
+  onSelect,
+  onAcknowledge,
+  onRenameSession,
+  onSetDisposition,
+  onPin,
+}: {
+  rows: ActiveSessionRow[];
+  activeSessionId: string | null;
+  now: number;
+  onSelect: (row: ActiveSessionRow) => void;
+  onAcknowledge?: (sessionId: string) => void;
+  onRenameSession?: (sessionId: string, title: string | null) => void;
+  onSetDisposition?: (sessionId: string, disposition: SessionDisposition) => void;
+  onPin?: (sessionId: string, pinned: boolean) => void;
+}) {
+  // Rows whose nested sessions are folded open. Collapsed by default: a
+  // session that delegates a lot would otherwise push everything else off.
+  const [openParents, setOpenParents] = useState<Set<string>>(() => new Set());
+  // The Background group: automated sessions, collapsed by default.
+  const [backgroundOpen, setBackgroundOpen] = useState(false);
+
+  if (rows.length === 0) {
+    return <div className="px-2 py-6 text-center text-xs text-gray-400">Nothing active</div>;
+  }
+
+  const { foreground, background } = splitBackground(groupNested(rows));
+  // Where the pinned group ends. The server sorts pinned rows first, so a
+  // divider before the first unpinned top-level row is all it takes to show
+  // the split (a pinned row's nested sessions stay above it, with their row).
+  const firstUnpinned = foreground.findIndex((group) => !group.row.pinned);
+  const toggle = (sessionId: string) =>
+    setOpenParents((prev) => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  const holds = (group: ActiveGroup, sessionId: string | null) =>
+    sessionId !== null &&
+    (group.row.sessionId === sessionId || group.nested.some((s) => s.sessionId === sessionId));
+  // The session being viewed is never hidden behind a fold.
+  const showBackground =
+    backgroundOpen || background.some((group) => holds(group, activeSessionId));
+  const backgroundCount = background.reduce((sum, group) => sum + 1 + group.nested.length, 0);
+  const backgroundRunning = background.reduce(
+    (sum, group) =>
+      sum + [group.row, ...group.nested].filter((s) => s.runtimeStatus === "running").length,
+    0,
+  );
+
+  const renderRow = (row: ActiveSessionRow) => (
+    <ActiveRow
+      row={row}
+      isActive={row.sessionId === activeSessionId}
+      now={now}
+      onSelect={onSelect}
+      onAcknowledge={onAcknowledge}
+      onRenameSession={onRenameSession}
+      onSetDisposition={onSetDisposition}
+      onPin={onPin}
+    />
+  );
+
+  const renderGroup = ({ row, nested }: ActiveGroup, divider: boolean) => {
+    const open =
+      openParents.has(row.sessionId) || nested.some((s) => s.sessionId === activeSessionId);
+    const running = nested.filter((s) => s.runtimeStatus === "running").length;
+    return (
+      <div key={row.sessionId}>
+        {divider && <div className="mx-2 my-1 border-t border-gray-100" />}
+        {renderRow(row)}
+        {nested.length > 0 && (
+          <div className="ml-4">
+            <button
+              type="button"
+              onClick={() => toggle(row.sessionId)}
+              aria-expanded={open}
+              className="flex w-full items-center gap-1 rounded-md px-2 py-0.5 text-left text-xs text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-700"
+            >
+              <CornerDownRight className="size-3 flex-shrink-0" />
+              <span>{nestedLabel(nested, running)}</span>
+              {open ? (
+                <ChevronDown className="size-3 flex-shrink-0" />
+              ) : (
+                <ChevronRight className="size-3 flex-shrink-0" />
+              )}
+            </button>
+            {open && nested.map((child) => <div key={child.sessionId}>{renderRow(child)}</div>)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="space-y-0.5">
+      {foreground.length === 0 && (
+        <div className="px-2 py-3 text-center text-xs text-gray-400">Nothing of yours active</div>
+      )}
+      {foreground.map((group, index) => renderGroup(group, index > 0 && index === firstUnpinned))}
+      {background.length > 0 && (
+        <div className="pt-1">
+          <div className="mx-2 mb-1 border-t border-gray-100" />
+          <button
+            type="button"
+            onClick={() => setBackgroundOpen((prev) => !prev)}
+            aria-expanded={showBackground}
+            className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs font-medium text-gray-500 transition-colors hover:bg-gray-50 hover:text-gray-700"
+          >
+            <Bot className="size-3.5 flex-shrink-0" />
+            <span className="flex-1">Background</span>
+            <span className="tabular-nums text-gray-400">
+              {backgroundRunning > 0 ? `${backgroundRunning} running · ` : ""}
+              {backgroundCount}
+            </span>
+            {showBackground ? (
+              <ChevronDown className="size-3 flex-shrink-0" />
+            ) : (
+              <ChevronRight className="size-3 flex-shrink-0" />
+            )}
+          </button>
+          {showBackground && background.map((group) => renderGroup(group, false))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One queue row.
+ *
+ * Carries everything the tree row does — rename, tmux, status — because
+ * once the queue is where the work lives, having to go find the session in its
+ * folder to rename it is exactly the friction the pane was meant to remove.
+ */
+function ActiveRow({
+  row,
+  isActive,
+  now,
+  onSelect,
+  onAcknowledge,
+  onRenameSession,
+  onSetDisposition,
+  onPin,
+}: {
+  row: ActiveSessionRow;
+  isActive: boolean;
+  now: number;
+  onSelect: (row: ActiveSessionRow) => void;
+  onAcknowledge?: (sessionId: string) => void;
+  onRenameSession?: (sessionId: string, title: string | null) => void;
+  onSetDisposition?: (sessionId: string, disposition: SessionDisposition) => void;
+  onPin?: (sessionId: string, pinned: boolean) => void;
+}) {
+  const [renaming, setRenaming] = useState(false);
+
+  if (renaming && onRenameSession) {
+    return (
+      <div className="flex w-full items-center px-2 py-1.5">
+        <SessionTitleInput
+          initial={row.title ?? ""}
+          placeholder={activeRowName(row)}
+          onCancel={() => setRenaming(false)}
+          onCommit={(value) => {
+            setRenaming(false);
+            onRenameSession(row.sessionId, value);
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="group relative">
+      <button
+        type="button"
+        onClick={() => onSelect(row)}
+        // `pr-7` reserves exactly the ⋯ button that overlays the row on hover,
+        // and nothing more. It was `pr-16` — four rems of permanent gutter,
+        // left over from when several action buttons sat there. Everything but
+        // the menu moved behind it long ago, so all that padding did was
+        // truncate every title a third of the way short of the edge.
+        className={`flex w-full items-start gap-2 rounded-md py-1.5 pl-2 pr-7 pointer-coarse:pr-9 text-left text-sm transition-colors ${
+          isActive
+            ? "bg-gray-100 text-gray-900"
+            : "text-gray-600 hover:bg-gray-50 hover:text-gray-900"
+        }`}
+      >
+        <SessionStatusMark status={row.runtimeStatus} disposition={row.disposition} />
+        <span className="min-w-0 flex-1">
+          {/* The mark leads the title; everything else is context below it.
+              Alignment comes from the fixed leading slot, not from forcing
+              every row to the same height — see `SessionStatusMark`. */}
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="min-w-0 flex-1 truncate">{activeRowName(row)}</span>
+            {runtimeHoldsTheSlot(row.runtimeStatus, row.disposition) && (
+              <DispositionChip disposition={row.disposition} />
+            )}
+          </span>
+          <span className="mt-0.5 flex min-w-0 items-center gap-1 text-xs text-gray-400">
+            {row.pinned && (
+              <Pin className="size-3 flex-shrink-0 text-blue-500" aria-label="Pinned" />
+            )}
+            {row.parentSessionId && (
+              <CornerDownRight className="size-3 flex-shrink-0" aria-label="Subagent" />
+            )}
+            <span className="truncate">
+              {row.parentSessionId ? "subagent · " : ""}
+              {row.workspaceName}
+            </span>
+            <SessionFolderBadge folder={row.folder} setup={row.worktreeSetup} />
+            <span className="flex-shrink-0">· {elapsedLabel(row.waitingSince, now)}</span>
+          </span>
+        </span>
+      </button>
+      {/* Shown on hover with a mouse. A finger has no hover, so on a touch
+          screen the ⋯ is always there. An open menu stays put when the
+          pointer wanders off the row. */}
+      <span className="absolute right-2 top-1.5 hidden group-hover:flex has-[[aria-expanded=true]]:flex pointer-coarse:flex">
+        <SessionMenu
+          sessionId={row.sessionId}
+          disposition={row.disposition}
+          pinned={row.pinned}
+          onTogglePin={onPin ? () => onPin(row.sessionId, !row.pinned) : undefined}
+          onRename={onRenameSession ? () => setRenaming(true) : undefined}
+          onSetDisposition={
+            onSetDisposition
+              ? (disposition) => onSetDisposition(row.sessionId, disposition)
+              : undefined
+          }
+          // Any row can be marked done, not just finished ones. This is a work
+          // queue — "I'm done with this" is a statement about the user, not
+          // about what the agent happens to be doing this second.
+          onAcknowledge={
+            onAcknowledge && row.disposition !== "resolved"
+              ? () => onAcknowledge(row.sessionId)
+              : undefined
+          }
+        />
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The one mark that leads every session row, in a slot of fixed width.
+ *
+ * Fixed is the whole point. A mark that only some rows carry makes the titles
+ * start at different offsets, and a column of titles that doesn't line up is
+ * one you have to read rather than scan — which defeats a pane whose entire
+ * job is answering "what's happening" at a glance. So the slot is always
+ * there, occupied or not, and every title in the sidebar begins at the same x.
+ *
+ * What goes in it, in order:
+ *
+ *   1. The **runtime** mark, when the agent is doing something. This is the
+ *      live axis and it wins, because it's the thing that changes while you're
+ *      looking at it.
+ *   2. Otherwise the **disposition** icon — where the work stands, which is
+ *      what a resting row has to say.
+ *
+ * When both exist (a `needs_review` session that started working again) the
+ * runtime mark takes the slot and the disposition follows the title, so
+ * nothing is lost and the alignment survives. See `DispositionChip`.
+ */
+function SessionStatusMark({
+  status,
+  disposition,
+}: {
+  status?: SessionRuntimeStatus;
+  disposition?: SessionDisposition;
+}) {
+  const presentation = runtimePresentation(status, disposition);
+
+  if (!presentation) {
+    // Falls through to the disposition, and to an empty slot of the same width
+    // when there's nothing to say at all.
+    return (
+      <span className="flex size-4 flex-shrink-0 items-center justify-center">
+        <DispositionChip disposition={disposition} />
+      </span>
+    );
+  }
+
+  if (presentation.dotClass === "spinner") {
+    return (
+      <span className="flex size-4 flex-shrink-0 items-center justify-center">
+        <span
+          title={presentation.label}
+          aria-label={presentation.label}
+          role="img"
+          className="inline-block size-2.5 animate-spin rounded-full border-[1.5px] border-emerald-500 border-t-transparent"
+        />
+      </span>
+    );
+  }
+
+  return (
+    <span className="flex size-4 flex-shrink-0 items-center justify-center">
+      <span
+        title={presentation.label}
+        aria-label={presentation.label}
+        role="img"
+        className={`inline-block size-2 rounded-full ${presentation.dotClass} ${
+          presentation.pulse ? "animate-pulse" : ""
+        }`}
+      />
+    </span>
+  );
+}
+
+/** Does the runtime mark hold the slot, leaving the disposition to trail? */
+function runtimeHoldsTheSlot(
+  status?: SessionRuntimeStatus,
+  disposition?: SessionDisposition,
+): boolean {
+  return runtimePresentation(status, disposition) !== undefined;
+}
+
+function DispositionChip({ disposition }: { disposition?: SessionDisposition }) {
+  const presentation = disposition ? DISPOSITION_PRESENTATION[disposition] : undefined;
+  if (!presentation) return null;
+  const { Icon } = presentation;
+  return (
+    <span
+      title={presentation.label}
+      aria-label={presentation.label}
+      role="img"
+      className={`inline-flex items-center ${presentation.className}`}
+    >
+      <Icon className="size-3.5" strokeWidth={2} aria-hidden="true" />
+    </span>
+  );
+}
+
+/**
+ * Which folder a session runs in, when it isn't the workspace root.
+ *
+ * A worktree shows its branch, anything else the folder's name; the full path
+ * is the tooltip. A folder that moved or is gone is struck through: the
+ * session's history is still there, but it can't resume in that folder.
+ */
+function FolderChip({ folder }: { folder: SessionFolderInfo }) {
+  const Icon = folder.kind === "worktree" ? GitBranch : FolderTree;
+  const title = folder.inactive ? `${folder.path} (folder is gone)` : folder.path;
+  return (
+    <span
+      title={title}
+      className={`inline-flex min-w-0 max-w-[40%] flex-shrink-0 items-center gap-0.5 rounded bg-gray-100 px-1 text-[11px] leading-4 ${
+        folder.inactive ? "text-gray-400 line-through" : "text-gray-500"
+      }`}
+    >
+      <Icon className="size-3 flex-shrink-0" aria-hidden="true" />
+      <span className="truncate">{folder.label}</span>
+    </span>
+  );
+}
+
+/**
+ * While a session's worktree is still being made, the badge says so in place
+ * of the folder chip (the folder doesn't exist yet); a failed setup says that,
+ * with the reason as the tooltip. Otherwise it is the plain folder chip.
+ */
+function SessionFolderBadge({
+  folder,
+  setup,
+}: {
+  folder?: SessionFolderInfo;
+  setup?: WorktreeSetupInfo;
+}) {
+  if (setup?.state === "running") {
+    return (
+      <span
+        title={`Setting up the ${setup.branch} worktree`}
+        className="inline-flex flex-shrink-0 items-center gap-0.5 rounded bg-amber-50 px-1 text-[11px] leading-4 text-amber-700"
+      >
+        <Loader2 className="size-3 flex-shrink-0 animate-spin" aria-hidden="true" />
+        Setting up
+      </span>
+    );
+  }
+  if (setup?.state === "failed") {
+    return (
+      <span
+        title={setup.error ?? `The ${setup.branch} worktree couldn't be set up`}
+        className="inline-flex flex-shrink-0 items-center gap-0.5 rounded bg-red-50 px-1 text-[11px] leading-4 text-red-700"
+      >
+        <OctagonAlert className="size-3 flex-shrink-0" aria-hidden="true" />
+        Setup failed
+      </span>
+    );
+  }
+  return folder ? <FolderChip folder={folder} /> : null;
+}
+
+// ── Top action button ───────────────────────────────────────────
+
+function TopAction({
+  icon: Icon,
+  label,
+  onClick,
+  disabled,
+}: {
+  icon: typeof Plus;
+  label: string;
+  onClick?: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors ${
+        disabled
+          ? "cursor-not-allowed text-gray-400"
+          : "text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+      }`}
+    >
+      <Icon className="size-4 flex-shrink-0" />
+      <span className="truncate">{label}</span>
+    </button>
+  );
+}
+
+// ── Session row ─────────────────────────────────────────────────
+
+function SessionRow({
+  session,
+  isActive,
+  href,
+  onSelect,
+  onRename,
+  onSetDisposition,
+}: {
+  session: SessionInfo;
+  isActive: boolean;
+  href: string;
+  onSelect: () => void;
+  /** Omitted when the host hasn't wired renaming — the affordance hides. */
+  onRename?: (session: SessionInfo, title: string | null) => Promise<void> | void;
+  /** Omitted when the host hasn't wired the human status axis. */
+  onSetDisposition?: (
+    session: SessionInfo,
+    disposition: SessionDisposition,
+  ) => Promise<void> | void;
+}) {
+  const [renaming, setRenaming] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  // A folder that just opened to reveal this row is no use if the row is below
+  // the fold — a workspace can hold hundreds of sessions, and the one you
+  // navigated to may sit a long way down. `nearest` only, so revealing a
+  // session never yanks the whole page around.
+  useEffect(() => {
+    if (!isActive) return;
+    rowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [isActive]);
+
+  // Real <a> so right-click / cmd-click / middle-click open in a new tab.
+  // Plain left-click is intercepted and routed through the SPA navigator.
+  const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    onSelect();
+  };
+
+  if (renaming && onRename) {
+    return (
+      <div className="flex w-full items-center py-1.5 pl-9 pr-3">
+        <SessionTitleInput
+          initial={session.title ?? ""}
+          placeholder={derivedSessionName(session)}
+          onCancel={() => setRenaming(false)}
+          onCommit={async (value) => {
+            setRenaming(false);
+            await onRename(session, value);
+          }}
+        />
+      </div>
+    );
+  }
+
+  return (
+    // The actions are siblings of the anchor, not children of it: a <button>
+    // inside an <a> is invalid HTML, and it also poisons the row's accessible
+    // name — a screen reader announced the session as "Copy tmux attach
+    // command". Overlaying them keeps the whole row clickable underneath.
+    <div className="group relative" ref={rowRef}>
+      <a
+        href={href}
+        onClick={handleClick}
+        // Full-width highlight (no rounded corners, no left margin) — the
+        // text gets the indent via pl-9 instead, so the active session reads
+        // as a flat row across the entire sidebar.
+        className={`flex w-full items-start justify-between gap-2 py-1.5 pl-9 pr-3 pointer-coarse:pr-10 text-left text-sm transition-colors ${
+          isActive
+            ? "bg-gray-100 text-gray-900"
+            : "text-gray-600 hover:bg-gray-50 hover:text-gray-900"
+        }`}
+      >
+        <span className="flex min-w-0 flex-1 items-start gap-1.5">
+          <SessionStatusMark status={session.runtimeStatus} disposition={session.disposition} />
+          <span className="min-w-0 flex-1">
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="min-w-0 flex-1 truncate">{formatSessionName(session)}</span>
+              <SessionFolderBadge folder={session.folder} setup={session.worktreeSetup} />
+              {runtimeHoldsTheSlot(session.runtimeStatus, session.disposition) && (
+                <DispositionChip disposition={session.disposition} />
+              )}
+            </span>
+          </span>
+        </span>
+        {/* Hidden on hover so the actions can take its place — the row is
+            dense already, and the time is the less useful of the two once
+            you've reached for the mouse. On a touch screen the ⋯ is always
+            shown and `pr-10` makes room for it, so the time stays. */}
+        <span className="flex-shrink-0 pt-0.5 text-xs text-gray-400 group-hover:invisible pointer-coarse:visible">
+          {formatTimeAgo(session.modified || session.created || "")}
+        </span>
+      </a>
+      {/* Shown on hover with a mouse. A finger has no hover, so on a touch
+          screen the ⋯ is always there. An open menu stays put when the
+          pointer wanders off the row. */}
+      <span className="absolute right-2 top-1.5 hidden group-hover:flex has-[[aria-expanded=true]]:flex pointer-coarse:flex">
+        <SessionMenu
+          sessionId={session.sessionId}
+          disposition={session.disposition}
+          onRename={onRename ? () => setRenaming(true) : undefined}
+          onSetDisposition={
+            onSetDisposition
+              ? (disposition) => void onSetDisposition(session, disposition)
+              : undefined
+          }
+        />
+      </span>
+    </div>
+  );
+}
+
+// ── Ref chips ───────────────────────────────────────────────────
+
+/**
+ * PR / ticket chips under a session title.
+ *
+ * The point is glanceability — being able to scan the list for "the #123
+ * work" without opening anything. Chips are capped so a session that mentions
+ * a dozen tickets can't push the row into a wall of badges.
+ */
+function SessionRefChips({ refs }: { refs?: SessionRefInfo[] }) {
+  if (!refs?.length) return null;
+
+  const shown = refs.slice(0, MAX_VISIBLE_REFS);
+  const overflow = refs.length - shown.length;
+
+  // No vertical margin of its own — callers place it, because it now shares a
+  // row with the disposition chip and the two must sit on the same baseline.
+  return (
+    <span className="flex flex-wrap items-center gap-1">
+      {shown.map((ref) => {
+        const isLinear = ref.type === "linear";
+        const chip = (
+          <span
+            className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium leading-none ${
+              isLinear ? "bg-indigo-50 text-indigo-700" : "bg-gray-100 text-gray-600"
+            }`}
+          >
+            {isLinear ? (
+              <Ticket className="h-2.5 w-2.5" aria-hidden />
+            ) : (
+              <GitPullRequest className="h-2.5 w-2.5" aria-hidden />
+            )}
+            {ref.label}
+          </span>
+        );
+
+        // Chips live inside the session <a>, so a nested anchor is invalid.
+        // Stop propagation instead and navigate manually, keeping the row
+        // click (open session) and the chip click (open PR/ticket) distinct.
+        return ref.url ? (
+          <span
+            key={ref.key}
+            role="link"
+            tabIndex={0}
+            title={ref.url}
+            className="cursor-pointer hover:opacity-80"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              window.open(ref.url, "_blank", "noopener,noreferrer");
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              e.stopPropagation();
+              window.open(ref.url, "_blank", "noopener,noreferrer");
+            }}
+          >
+            {chip}
+          </span>
+        ) : (
+          <span key={ref.key}>{chip}</span>
+        );
+      })}
+      {overflow > 0 && (
+        <span className="text-[10px] text-gray-400" title={refs.map((r) => r.label).join(", ")}>
+          +{overflow}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ── Workspace item ──────────────────────────────────────────────
+
+function WorkspaceItem({
+  workspace,
+  sessions,
+  hasMore,
+  isActive,
+  activeSessionId,
+  defaultExpanded,
+  revealSession,
+  onWorkspaceSelect,
+  onSessionSelect,
+  onRenameSession,
+  onSetSessionDisposition,
+  onNewSession,
+  onLoadMore,
+  onMenuAction,
+}: {
+  workspace: WorkspaceInfo;
+  sessions: SessionInfo[];
+  /** True when the server has more sessions beyond what we've fetched. */
+  hasMore: boolean;
+  isActive: boolean;
+  activeSessionId: string | null;
+  defaultExpanded: boolean;
+  /** The open session lives here and should be visible in the tree — reveal it. */
+  revealSession: boolean;
+  onWorkspaceSelect: (workspace: WorkspaceInfo) => void;
+  onSessionSelect: (session: SessionInfo, workspace: WorkspaceInfo) => void;
+  onRenameSession?: (session: SessionInfo, title: string | null) => Promise<void> | void;
+  onSetSessionDisposition?: (
+    session: SessionInfo,
+    disposition: SessionDisposition,
+  ) => Promise<void> | void;
+  onNewSession: (workspace: WorkspaceInfo) => void;
+  onLoadMore?: (workspaceId: string) => Promise<void> | void;
+  onMenuAction?: (action: WorkspaceMenuAction, workspace: WorkspaceInfo) => void;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useClickOutside<HTMLDivElement>(menuOpen, () => setMenuOpen(false));
+
+  // Folders stay as the user left them, with one exception: a current session
+  // the ACTIVE queue isn't showing.
+  //
+  // The original rule was no auto-expand at all, on the grounds that the queue
+  // above already surfaces live work from every workspace — so unfolding a
+  // folder because its workspace became current just buries a list that had
+  // already answered the question. That holds right up until the open session
+  // *isn't* in the queue: arrive at a resolved session from search and the nav
+  // says nothing about where you are, in either list. Expanding is then the
+  // only thing that answers it.
+  // Adjusted during render on the transition, rather than in an effect: an
+  // effect would expand *after* a paint that didn't, and the folder would
+  // visibly flick open. Tracking the previous value is what keeps this a
+  // one-shot — the user can still collapse the folder afterwards, which a
+  // plain `expanded || revealSession` would make impossible for as long as the
+  // session stayed current.
+  const [wasRevealing, setWasRevealing] = useState(revealSession);
+  if (revealSession !== wasRevealing) {
+    setWasRevealing(revealSession);
+    if (revealSession) setExpanded(true);
+  }
+
+  const handleLoadMore = async () => {
+    if (!onLoadMore || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      await onLoadMore(workspace.id);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  return (
+    <div>
+      {/* Workspace header row — never highlighted; only the active session
+          inside it gets the highlight (matches Codex). */}
+      <div className="group flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-gray-50">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="relative flex-shrink-0 rounded p-0.5 text-gray-500 hover:bg-gray-200 hover:text-gray-700"
+          title={expanded ? "Collapse" : "Expand"}
+        >
+          {expanded ? <FolderOpen className="size-4" /> : <Folder className="size-4" />}
+          {workspace.pinned && (
+            // Pinned indicator — small blue dot on the upper-right corner
+            // of the folder icon, like a notification badge.
+            <span
+              className="absolute right-0 top-0 size-1.5 rounded-full bg-blue-500"
+              aria-label="Pinned"
+            />
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() => onWorkspaceSelect(workspace)}
+          className="flex min-w-0 flex-1 flex-col items-start text-left"
+        >
+          <span className="w-full truncate text-sm font-medium text-gray-900">
+            {workspace.name}
+          </span>
+        </button>
+
+        {/* Hover actions: ··· menu and new session. A touch screen can't
+            hover, so there they always show. */}
+        <div className="relative flex-shrink-0 opacity-0 transition-opacity group-hover:opacity-100 pointer-coarse:opacity-100">
+          <div className="flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => setMenuOpen((v) => !v)}
+              className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-gray-700"
+              title="More actions"
+            >
+              <MoreHorizontal className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => onNewSession(workspace)}
+              className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-gray-700"
+              title="New session"
+            >
+              <SquarePlus className="size-4" />
+            </button>
+          </div>
+          {menuOpen && (
+            <div
+              ref={menuRef}
+              className="absolute right-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-md border border-gray-200 bg-white shadow-lg"
+            >
+              <WorkspaceMenuItem
+                icon={workspace.pinned ? PinOff : Pin}
+                label={workspace.pinned ? "Unpin workspace" : "Pin workspace"}
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("pin", workspace);
+                }}
+              />
+              <WorkspaceMenuItem
+                icon={RefreshCw}
+                label="Refresh sessions"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("refresh", workspace);
+                }}
+              />
+              <WorkspaceMenuItem
+                icon={Folder}
+                label="Open in Finder"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("openInFinder", workspace);
+                }}
+              />
+              <WorkspaceMenuItem
+                icon={FolderTree}
+                label="Folders…"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("folders", workspace);
+                }}
+              />
+              <WorkspaceMenuItem
+                icon={Puzzle}
+                label="Create permanent worktree"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("createWorktree", workspace);
+                }}
+              />
+              <WorkspaceMenuItem
+                icon={Pencil}
+                label="Rename workspace"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("rename", workspace);
+                }}
+              />
+              <div className="my-1 border-t border-gray-200" />
+              <WorkspaceMenuItem
+                icon={Trash2}
+                label="Archive chats"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("archive", workspace);
+                }}
+              />
+              <WorkspaceMenuItem
+                icon={Trash2}
+                label="Remove"
+                destructive
+                onClick={() => {
+                  setMenuOpen(false);
+                  onMenuAction?.("remove", workspace);
+                }}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Sessions list — full-width rows; the indent lives on each row's
+          left padding so the active highlight runs edge-to-edge. */}
+      {expanded && (
+        <div className="mt-0.5 space-y-0.5">
+          {sessions.length === 0 ? (
+            <div className="py-1 pl-9 pr-3 text-xs text-gray-400">No sessions yet</div>
+          ) : (
+            sessions.map((session) => (
+              <SessionRow
+                key={session.sessionId}
+                session={session}
+                isActive={isActive && activeSessionId === session.sessionId}
+                href={`/chat/${workspace.id}/${session.sessionId}`}
+                onSelect={() => onSessionSelect(session, workspace)}
+                onRename={onRenameSession}
+                onSetDisposition={onSetSessionDisposition}
+              />
+            ))
+          )}
+          {hasMore && (
+            <button
+              type="button"
+              onClick={handleLoadMore}
+              disabled={loadingMore}
+              className="py-1 pl-9 pr-3 text-xs text-gray-500 hover:text-gray-700 disabled:opacity-50"
+            >
+              {loadingMore ? "Loading…" : "Show more"}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WorkspaceMenuItem({
+  icon: Icon,
+  label,
+  onClick,
+  destructive,
+}: {
+  icon: typeof Pencil;
+  label: string;
+  onClick: () => void;
+  destructive?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors ${
+        destructive ? "text-red-600 hover:bg-red-50" : "text-gray-700 hover:bg-gray-100"
+      }`}
+    >
+      <Icon className="size-4 flex-shrink-0" />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+// ── Settings popup ──────────────────────────────────────────────
+
+function SettingsPopup({
+  onAction,
+  onClose,
+}: {
+  onAction?: (action: SettingsMenuAction) => void;
+  onClose: () => void;
+}) {
+  const ref = useClickOutside<HTMLDivElement>(true, onClose);
+  return (
+    <div
+      ref={ref}
+      className="absolute bottom-full left-2 mb-1 w-60 overflow-hidden rounded-md border border-gray-200 bg-white shadow-lg"
+    >
+      <div className="border-b border-gray-200 px-3 py-2">
+        <div className="flex items-center gap-2 text-sm text-gray-700">
+          <User className="size-4 text-gray-500" />
+          <span className="truncate">You</span>
+        </div>
+        <div className="mt-1 ml-6 text-xs text-gray-500">Local account</div>
+      </div>
+      <WorkspaceMenuItem
+        icon={SettingsIcon}
+        label="Settings"
+        onClick={() => {
+          onClose();
+          onAction?.("settings");
+        }}
+      />
+      <WorkspaceMenuItem
+        icon={Zap}
+        label="Rate limits remaining"
+        onClick={() => {
+          onClose();
+          onAction?.("rateLimits");
+        }}
+      />
+      <div className="my-1 border-t border-gray-200" />
+      <WorkspaceMenuItem
+        icon={LogOut}
+        label="Log out"
+        onClick={() => {
+          onClose();
+          onAction?.("logout");
+        }}
+      />
+    </div>
+  );
+}
+
+// ── Search modal ────────────────────────────────────────────────
+
+/** How long typing has to settle before a query goes to the server. */
+const SEARCH_DEBOUNCE_MS = 180;
+
+/**
+ * Render a snippet, bolding the matched terms.
+ *
+ * The server wraps matches in `«»` — chosen because they never occur in code
+ * or prose here, so splitting on them can't misfire the way `**` or `<b>`
+ * would in a transcript full of markdown and HTML.
+ */
+function SnippetText({ snippet }: { snippet: string }) {
+  const parts = snippet.split(/«([^»]*)»/g);
+  return (
+    <span className="text-xs leading-relaxed text-gray-500">
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          // eslint-disable-next-line react/no-array-index-key -- split order is the identity
+          <mark key={i} className="rounded-sm bg-amber-100 px-0.5 text-gray-900">
+            {part}
+          </mark>
+        ) : (
+          <span key={i}>{part}</span>
+        ),
+      )}
+    </span>
+  );
+}
+
+/**
+ * Find a session by what was said in it.
+ *
+ * With an empty box this is still the recent-chats list it always was — the
+ * fast path for "the thing I had open ten minutes ago". Type, and it becomes a
+ * full-text search over every message in every workspace, which is a different
+ * question ("where did we work out the port hashing?") and needs the server.
+ */
+function SearchModal({
+  workspaces,
+  sessionsByWorkspace,
+  onSearch,
+  onClose,
+  onSelect,
+}: {
+  workspaces: WorkspaceInfo[];
+  sessionsByWorkspace: Record<string, SessionInfo[]>;
+  onSearch?: (query: string) => Promise<SessionSearchResult>;
+  onClose: () => void;
+  onSelect: (workspace: WorkspaceInfo, session: SessionInfo) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [result, setResult] = useState<SessionSearchResult | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [cursor, setCursor] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Focus the input when the modal opens.
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  // Debounced search. The generation counter is what keeps a slow early query
+  // from overwriting the results of a later, faster one.
+  useEffect(() => {
+    if (!onSearch || !query.trim()) {
+      setResult(null);
+      setSearching(false);
+      return;
+    }
+
+    let live = true;
+    setSearching(true);
+    const timer = setTimeout(() => {
+      onSearch(query)
+        .then((next) => {
+          if (!live) return;
+          setResult(next);
+          setCursor(0);
+        })
+        .catch((error: unknown) => {
+          if (!live) return;
+          console.error("Search failed", error);
+          setResult({ hits: [], relaxed: false });
+        })
+        .finally(() => {
+          if (live) setSearching(false);
+        });
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [query, onSearch]);
+
+  // Recent chats — the empty-query view, and the fallback when no search
+  // handler is wired (an embedded client may mount the drawer without one).
+  const recent = useMemo(() => {
+    const rows: Array<{ workspace: WorkspaceInfo; session: SessionInfo }> = [];
+    for (const ws of workspaces) {
+      for (const session of sessionsByWorkspace[ws.id] ?? []) rows.push({ workspace: ws, session });
+    }
+    rows.sort((a, b) => {
+      const at = a.session.modified || a.session.created || "";
+      const bt = b.session.modified || b.session.created || "";
+      return bt.localeCompare(at);
+    });
+    if (!query) return rows.slice(0, 50);
+    const q = query.toLowerCase();
+    return rows.filter(
+      ({ workspace, session }) =>
+        formatSessionName(session).toLowerCase().includes(q) ||
+        workspace.name.toLowerCase().includes(q),
+    );
+  }, [workspaces, sessionsByWorkspace, query]);
+
+  const searchMode = Boolean(onSearch && query.trim());
+
+  const openHit = (hit: SessionSearchHit) => {
+    const workspace = workspaces.find((ws) => ws.id === hit.workspaceId);
+    if (!workspace) return;
+    // A hit can name a session this workspace hasn't paged in, so the row is
+    // synthesized from what search returned rather than looked up.
+    onSelect(workspace, {
+      sessionId: hit.sessionId,
+      title: hit.title,
+      modified: hit.matchedAt,
+      refs: hit.refs,
+    });
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      onClose();
+      return;
+    }
+    const hits = result?.hits;
+    if (!searchMode || !hits?.length) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setCursor((c) => Math.min(c + 1, hits.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setCursor((c) => Math.max(c - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const hit = hits[cursor];
+      if (hit) openHit(hit);
+    }
+  };
+
+  return (
+    <div
+      role="button"
+      tabIndex={-1}
+      aria-label="Close search"
+      className="fixed inset-0 z-50 flex items-start justify-center bg-gradient-to-b from-black/10 to-black/20 pt-24 backdrop-blur-xs"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Chat search"
+        className="w-full max-w-xl overflow-hidden rounded-lg bg-white shadow-2xl"
+      >
+        <div className="border-b border-gray-200 p-3">
+          <input
+            ref={inputRef}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={onSearch ? "Search every message" : "Search chats"}
+            className="w-full bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
+          />
+        </div>
+        <div className="max-h-96 overflow-y-auto py-1">
+          <div className="flex items-center justify-between px-3 py-1 text-xs uppercase tracking-wide text-gray-400">
+            <span>{query ? "Results" : "Recent chats"}</span>
+            {searching && <span className="normal-case tracking-normal">searching…</span>}
+          </div>
+
+          {searchMode ? (
+            <SearchResults result={result} searching={searching} cursor={cursor} onOpen={openHit} />
+          ) : recent.length === 0 ? (
+            <div className="px-3 py-2 text-sm text-gray-500">No matches</div>
+          ) : (
+            recent.map(({ workspace, session }) => {
+              const href = `/chat/${workspace.id}/${session.sessionId}`;
+              return (
+                <a
+                  key={`${workspace.id}-${session.sessionId}`}
+                  href={href}
+                  onClick={(e) => {
+                    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                    e.preventDefault();
+                    onSelect(workspace, session);
+                  }}
+                  className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm hover:bg-gray-50"
+                >
+                  <span className="truncate text-gray-700">{formatSessionName(session)}</span>
+                  <span className="flex-shrink-0 text-xs text-gray-400">{workspace.name}</span>
+                </a>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SearchResults({
+  result,
+  searching,
+  cursor,
+  onOpen,
+}: {
+  result: SessionSearchResult | null;
+  searching: boolean;
+  cursor: number;
+  onOpen: (hit: SessionSearchHit) => void;
+}) {
+  const hits = result?.hits ?? null;
+  if (hits === null) {
+    return (
+      <div className="px-3 py-2 text-sm text-gray-400">{searching ? "" : "Type to search"}</div>
+    );
+  }
+
+  if (hits.length === 0) {
+    return (
+      <div className="px-3 py-3 text-sm text-gray-500">
+        No matches.
+        {/* Stated rather than hidden: a search that silently can't see tool
+            output teaches you to distrust it. */}
+        <div className="mt-1 text-xs text-gray-400">
+          Prompts and replies are searchable; command output isn&apos;t indexed.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {result?.relaxed && (
+        <div className="px-3 pb-1 text-xs text-gray-400">
+          No message contained every word — showing sessions matching any of them.
+        </div>
+      )}
+      {hits.map((hit, i) => (
+        <button
+          key={hit.sessionId}
+          type="button"
+          onClick={() => onOpen(hit)}
+          className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left hover:bg-gray-50 ${
+            i === cursor ? "bg-gray-50" : ""
+          }`}
+        >
+          <span className="flex items-baseline justify-between gap-2">
+            <span className="truncate text-sm text-gray-700">{hit.title}</span>
+            <span className="flex flex-shrink-0 items-center gap-1.5 text-xs text-gray-400">
+              {hit.matches > 1 && <span>{hit.matches}×</span>}
+              {/* Where and when, the same pair a nav row carries. Results are
+                  ranked by relevance, which says nothing about age — without a
+                  date, a hit from this morning and one from last year sit side
+                  by side looking identical. */}
+              <span>
+                {hit.workspaceName}
+                {hit.modified && ` · ${formatTimeAgo(hit.modified)}`}
+              </span>
+            </span>
+          </span>
+          <SnippetText snippet={hit.snippet} />
+          <span className="mt-0.5 flex items-center gap-2">
+            <SessionRefChips refs={hit.refs} />
+            {hit.archived && (
+              <span
+                className="text-[10px] text-gray-400"
+                title="Transcript was deleted by Claude Code; only the indexed conversation remains"
+              >
+                archived
+              </span>
+            )}
+          </span>
+        </button>
+      ))}
+    </>
+  );
+}
+
+// ── Tabs ────────────────────────────────────────────────────────
+
+type NavTab = "active" | "workspaces";
+
+/** One half of the Active | Workspaces toggle. */
+function NavTabButton({
+  label,
+  count,
+  selected,
+  onClick,
+}: {
+  label: string;
+  /** Shown beside the label when present and non-zero. */
+  count?: number;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={selected}
+      onClick={onClick}
+      className={`flex flex-1 items-center justify-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
+        selected ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700"
+      }`}
+    >
+      {label}
+      {count ? <span className="text-gray-400">{count}</span> : null}
+    </button>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────────
+
+export function NavigationDrawer({
+  workspaces,
+  sessionsByWorkspace,
+  hasMoreByWorkspace,
+  activeWorkspace,
+  activeSessionId,
+  onWorkspaceSelect,
+  onSessionSelect,
+  onRenameSession,
+  onSetSessionDisposition,
+  onNewSession,
+  onNewWorkspace,
+  onOpenNewSession,
+  onLoadMoreSessions,
+  onWorkspaceMenuAction,
+  onSettingsMenuAction,
+  onSearchSessions,
+  activeSessions,
+  activeNow,
+  onAcknowledgeSession,
+  onPinSession,
+}: NavigationDrawerProps) {
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tab, setTab] = useState<NavTab>("active");
+
+  // Rendered in the server's order, untouched.
+  //
+  // This used to hoist the tab's own session to the front, so the row you were
+  // working in couldn't slide away when something finished elsewhere. But it
+  // moves a row on *every* click: walk down the list opening sessions and each
+  // one jumps to the top as you select it, dragging the rest down a place. The
+  // row you meant to click next is no longer where you were looking. Being
+  // findable beats being first, and the highlight already says which one it is.
+  const activeRows = activeSessions ?? [];
+  // The tab counts what's the user's; the Background group shows its own count.
+  const foregroundCount = useMemo(() => {
+    const { foreground } = splitBackground(groupNested(activeRows));
+    return foreground.reduce((sum, group) => sum + 1 + group.nested.length, 0);
+  }, [activeRows]);
+
+  /**
+   * The workspace whose folder should open to show the current session.
+   *
+   * Always while the Workspaces tab is showing, so switching to it lands on
+   * where you are. On the Active tab, only for a session the queue isn't
+   * showing (a resolved one opened from search, say): otherwise clicking down
+   * the queue would quietly unfold a folder per click in the hidden tree, and
+   * the Workspaces tab would open on a mess of expanded folders.
+   */
+  const currentIsQueued = activeRows.some((row) => row.sessionId === activeSessionId);
+  const revealInWorkspaceId =
+    activeSessionId && activeWorkspace && (tab === "workspaces" || !currentIsQueued)
+      ? activeWorkspace.id
+      : null;
+
+  return (
+    <>
+      <div className="flex h-full w-full flex-col border-r border-gray-200 bg-white">
+        {/* Fixed top */}
+        <div className="flex flex-col gap-0.5 border-b border-gray-200 p-2">
+          <TopAction icon={Plus} label="New workspace" onClick={onNewWorkspace} />
+          {onOpenNewSession && (
+            <TopAction icon={MessageSquarePlus} label="New session" onClick={onOpenNewSession} />
+          )}
+          <TopAction icon={Search} label="Search" onClick={() => setSearchOpen(true)} />
+        </div>
+
+        <div className="flex gap-0.5 rounded-md bg-gray-100 p-0.5 mx-2 mt-2" role="tablist">
+          <NavTabButton
+            label="Active"
+            count={foregroundCount}
+            selected={tab === "active"}
+            onClick={() => setTab("active")}
+          />
+          <NavTabButton
+            label="Workspaces"
+            selected={tab === "workspaces"}
+            onClick={() => setTab("workspaces")}
+          />
+        </div>
+
+        {/* Both panes stay mounted and the hidden one is only hidden, so each
+            keeps its scroll position and the tree keeps its open folders
+            across tab switches. */}
+        <div
+          className={`flex-1 overflow-y-auto p-2 ${tab === "active" ? "" : "hidden"}`}
+          role="tabpanel"
+        >
+          <ActivePane
+            rows={activeRows}
+            activeSessionId={activeSessionId}
+            now={activeNow ?? Date.now()}
+            onSelect={(row) => {
+              const workspace = workspaces.find((w) => w.id === row.workspaceId);
+              if (workspace) {
+                onSessionSelect({ sessionId: row.sessionId }, workspace);
+              }
+            }}
+            onAcknowledge={onAcknowledgeSession}
+            onRenameSession={
+              onRenameSession
+                ? (sessionId, title) => void onRenameSession({ sessionId }, title)
+                : undefined
+            }
+            onSetDisposition={
+              onSetSessionDisposition
+                ? (sessionId, disposition) =>
+                    void onSetSessionDisposition({ sessionId }, disposition)
+                : undefined
+            }
+            onPin={onPinSession}
+          />
+        </div>
+
+        <div
+          className={`flex-1 overflow-y-auto p-2 ${tab === "workspaces" ? "" : "hidden"}`}
+          role="tabpanel"
+        >
+          <div className="space-y-0.5">
+            {workspaces.map((workspace) => (
+              <WorkspaceItem
+                key={workspace.id}
+                workspace={workspace}
+                sessions={sessionsByWorkspace[workspace.id] ?? []}
+                hasMore={hasMoreByWorkspace?.[workspace.id] ?? false}
+                isActive={activeWorkspace?.id === workspace.id}
+                activeSessionId={activeSessionId}
+                defaultExpanded={false}
+                revealSession={revealInWorkspaceId === workspace.id}
+                onWorkspaceSelect={onWorkspaceSelect}
+                onSessionSelect={onSessionSelect}
+                onRenameSession={onRenameSession}
+                onSetSessionDisposition={onSetSessionDisposition}
+                onNewSession={onNewSession}
+                onLoadMore={onLoadMoreSessions}
+                onMenuAction={onWorkspaceMenuAction}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Fixed bottom */}
+        <div className="relative border-t border-gray-200 p-2">
+          <TopAction
+            icon={SettingsIcon}
+            label="Settings"
+            onClick={() => setSettingsOpen((v) => !v)}
+          />
+          {settingsOpen && (
+            <SettingsPopup onAction={onSettingsMenuAction} onClose={() => setSettingsOpen(false)} />
+          )}
+        </div>
+      </div>
+
+      {searchOpen && (
+        <SearchModal
+          workspaces={workspaces}
+          sessionsByWorkspace={sessionsByWorkspace}
+          onSearch={onSearchSessions}
+          onClose={() => setSearchOpen(false)}
+          onSelect={(workspace, session) => {
+            setSearchOpen(false);
+            // Single navigate — onSessionSelect carries the workspace, so
+            // we don't race a `latest` redirect from onWorkspaceSelect.
+            onSessionSelect(session, workspace);
+          }}
+        />
+      )}
+    </>
+  );
+}

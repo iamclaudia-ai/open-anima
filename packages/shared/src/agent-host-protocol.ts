@@ -1,0 +1,172 @@
+/**
+ * Agent Host WebSocket Protocol
+ *
+ * Shared types for messages between extensions and agent-host.
+ */
+
+// ── Client → Server Messages ─────────────────────────────────
+
+/** Identify which extension is connecting and which sessions to resume */
+export interface AuthMessage {
+  type: "auth";
+  extensionId: string; // "session" or "codex"
+  /** Sessions to subscribe to and replay events for (reconnect scenario) */
+  resumeSessions?: Array<{ sessionId: string; lastSeq: number }>;
+}
+
+/** Create a new SDK session */
+export interface CreateSessionMessage {
+  type: "session.create";
+  requestId: string;
+  params: {
+    sessionId?: string;
+    cwd: string;
+    model?: string;
+    systemPrompt?: string;
+    thinking?: boolean;
+    effort?: string;
+    agent?: string;
+    /** Permission profile name (required by agent-host). */
+    profile: string;
+  };
+}
+
+/** Send a prompt to an existing session */
+export interface PromptMessage {
+  type: "session.prompt";
+  requestId: string;
+  sessionId: string;
+  content: string | unknown[];
+  cwd?: string; // for auto-resume
+  model?: string; // preferred model for auto-resume
+  agent?: string;
+  /** Permission profile from the session's row; authoritative for (re)launch. */
+  profile: string;
+}
+
+/** Interrupt a session */
+export interface InterruptMessage {
+  type: "session.interrupt";
+  requestId: string;
+  sessionId: string;
+}
+
+/** Answer a modal prompt the CLI runtime is blocked on */
+export interface AnswerModalMessage {
+  type: "session.answer_modal";
+  requestId: string;
+  sessionId: string;
+  /** Option key to press, as rendered in the prompt ("1", "2", …). */
+  key: string;
+  /** Fingerprint of the prompt the caller saw — rejects an answer to a stale one. */
+  fingerprint?: string;
+}
+
+/** Close a session */
+export interface CloseMessage {
+  type: "session.close";
+  requestId: string;
+  sessionId: string;
+}
+
+/** Set permission mode */
+export interface SetPermissionModeMessage {
+  type: "session.set_permission_mode";
+  requestId: string;
+  sessionId: string;
+  mode: string;
+}
+
+/** Send tool result */
+export interface SendToolResultMessage {
+  type: "session.send_tool_result";
+  requestId: string;
+  sessionId: string;
+  toolUseId: string;
+  content: string;
+  isError?: boolean;
+}
+
+/** List active sessions managed by agent-host */
+export interface ListSessionsMessage {
+  type: "session.list";
+  requestId: string;
+}
+
+/** Spawn a child agent session and immediately prompt it */
+export interface SpawnSubagentMessage {
+  type: "subagent.spawn";
+  requestId: string;
+  params: {
+    parentSessionId: string;
+    subagentId?: string;
+    agent?: string;
+    prompt: string;
+    cwd?: string;
+    model?: string;
+    systemPrompt?: string;
+    thinking?: boolean;
+    effort?: string;
+    sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+    metadata?: Record<string, unknown>;
+    /** Permission profile name (required by agent-host). */
+    profile: string;
+  };
+}
+
+/**
+ * Subscribe to sessions this client wants events for, without replaying them.
+ *
+ * `auth.resumeSessions` covers the reconnect case, where the client knows how
+ * far it got and wants the gap filled. This covers the one it can't: a client
+ * that has just *started* knows nothing, so it has no sequence numbers to
+ * resume from and would sit subscribed to nothing while sessions it cares
+ * about run to completion without it. Deliberately no replay — a fresh process
+ * asking for the whole buffer would re-deliver a turn's worth of deltas into
+ * a chat that already rendered them.
+ */
+export interface SubscribeSessionsMessage {
+  type: "session.subscribe";
+  requestId: string;
+  sessionIds: string[];
+}
+
+/** Union of all client-to-server messages */
+export type AgentHostClientMessage =
+  | AuthMessage
+  | SubscribeSessionsMessage
+  | CreateSessionMessage
+  | PromptMessage
+  | InterruptMessage
+  | AnswerModalMessage
+  | CloseMessage
+  | SetPermissionModeMessage
+  | SendToolResultMessage
+  | ListSessionsMessage
+  | SpawnSubagentMessage;
+
+// ── Server → Client Messages ─────────────────────────────────
+
+/** Response to a request (success or error) */
+export interface AgentHostResponseMessage {
+  type: "res";
+  requestId: string;
+  ok: boolean;
+  payload?: unknown;
+  error?: string;
+}
+
+/** Streaming event from an SDK session */
+export interface AgentHostSessionEventMessage {
+  type: "session.event";
+  sessionId: string;
+  event: {
+    type: string; // "message_start", "content_block_delta", "turn_stop", etc.
+    [key: string]: unknown;
+  };
+  /** Monotonic sequence number within the session, for gap detection on reconnect */
+  seq: number;
+}
+
+/** Union of all server-to-client messages */
+export type AgentHostServerMessage = AgentHostResponseMessage | AgentHostSessionEventMessage;

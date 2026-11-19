@@ -1,0 +1,309 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { closeDb } from "./workspace-db";
+import { createWorkspace } from "./workspace";
+import {
+  closeSessionDb,
+  getRefsForSessions,
+  getSessionDb,
+  setSessionRefs,
+  upsertSession,
+} from "./session-store";
+import { backfillSessionRefs, clearRefScanWatermarks, syncSessionRefs } from "./session-ref-sync";
+import type { RefsConfig } from "./session-refs";
+
+const config: RefsConfig = {
+  linear: { prefixes: ["ENG", "WEB"], workspace: "acme" },
+  github: { defaultRepo: "acme/app", minDigits: 2 },
+};
+
+let dataDir: string;
+let prevDataDir: string | undefined;
+let workspaceId: string;
+let entryId = 0;
+
+/**
+ * Stand in for the memory extension's table.
+ *
+ * Session reads this corpus but doesn't own it, so the test creates it exactly
+ * as memory does rather than reaching for a shared migration — if the real
+ * shape drifts, this is where it should be noticed.
+ */
+function createTranscriptTable(db: Database): void {
+  db.exec(`
+    CREATE TABLE memory_transcript_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, source_file TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL,
+      tool_names TEXT, timestamp TEXT NOT NULL, cwd TEXT,
+      ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+}
+
+function addEntry(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string,
+  timestamp = new Date().toISOString(),
+): void {
+  entryId++;
+  getSessionDb()
+    .query(
+      `INSERT INTO memory_transcript_entries (session_id, source_file, role, content, timestamp)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(sessionId, `${sessionId}.jsonl`, role, content, timestamp);
+}
+
+function addSession(sessionId: string, createdAt?: string): void {
+  upsertSession({
+    id: sessionId,
+    workspaceId,
+    providerSessionId: sessionId,
+    model: "claude-opus-5",
+    agent: "claude",
+    purpose: "chat",
+    runtimeStatus: "idle",
+    lastActivity: createdAt ?? new Date().toISOString(),
+  });
+  // `upsertSession` always stamps `created_at` with now; backdating it is how a
+  // test represents a session that isn't new.
+  if (createdAt) {
+    getSessionDb()
+      .query("UPDATE sessions SET created_at = ? WHERE provider_session_id = ?")
+      .run(createdAt, sessionId);
+  }
+}
+
+const keysOf = (sessionId: string): string[] =>
+  (getRefsForSessions([sessionId]).get(sessionId) ?? []).map((ref) => ref.key);
+
+describe("syncSessionRefs", () => {
+  beforeEach(() => {
+    prevDataDir = process.env.ANIMA_DATA_DIR;
+    dataDir = mkdtempSync(join(tmpdir(), "anima-ref-sync-"));
+    process.env.ANIMA_DATA_DIR = dataDir;
+    closeDb();
+    closeSessionDb();
+    createTranscriptTable(getSessionDb());
+    workspaceId = createWorkspace({ name: "webapp", cwd: join(dataDir, "webapp") }).id;
+    entryId = 0;
+  });
+
+  afterEach(() => {
+    closeDb();
+    closeSessionDb();
+    if (prevDataDir === undefined) delete process.env.ANIMA_DATA_DIR;
+    else process.env.ANIMA_DATA_DIR = prevDataDir;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test("picks up refs mentioned mid-conversation, not just in the opening prompt", () => {
+    addSession("s1");
+    addEntry("s1", "user", "let's look at the nav");
+    addEntry("s1", "assistant", "That's the same breakage as WEB-42 — filed as #412.");
+
+    const result = syncSessionRefs(
+      [{ sessionId: "s1", titleText: "let's look at the nav" }],
+      config,
+    );
+
+    expect(result.updated).toBe(1);
+    // Within one message `extractRefs` emits GitHub refs before Linear ones,
+    // regardless of where each appeared in the text.
+    expect(keysOf("s1")).toEqual(["acme/app#412", "WEB-42"]);
+  });
+
+  test("keeps the opening prompt's ref as the leading chip", () => {
+    addSession("s2");
+    addEntry("s2", "user", "review ENG-101 for me");
+    addEntry("s2", "assistant", "Related work landed in #900.");
+
+    syncSessionRefs([{ sessionId: "s2", titleText: "review ENG-101 for me" }], config);
+
+    expect(keysOf("s2")).toEqual(["ENG-101", "acme/app#900"]);
+  });
+
+  test("a second pass reads only new entries and leaves an unchanged set alone", () => {
+    addSession("s3");
+    addEntry("s3", "user", "start on WEB-77");
+
+    const first = syncSessionRefs([{ sessionId: "s3" }], config);
+    expect(first.scanned).toBe(1);
+    expect(first.updated).toBe(1);
+
+    // Nothing new — the watermark means there is nothing to re-read, so no
+    // write happens either.
+    const second = syncSessionRefs(
+      [{ sessionId: "s3", currentRefs: getRefsForSessions(["s3"]).get("s3") }],
+      config,
+    );
+    expect(second.scanned).toBe(0);
+    expect(second.updated).toBe(0);
+
+    addEntry("s3", "assistant", "opened #55 for it");
+    const third = syncSessionRefs(
+      [{ sessionId: "s3", currentRefs: getRefsForSessions(["s3"]).get("s3") }],
+      config,
+    );
+    expect(third.scanned).toBe(1);
+    expect(keysOf("s3")).toEqual(["WEB-77", "acme/app#55"]);
+  });
+
+  test("refs already on the row survive a pass that re-reads nothing", () => {
+    addSession("s4");
+    setSessionRefs("s4", [{ type: "linear", key: "ENG-1", label: "ENG-1" }]);
+    addEntry("s4", "user", "and also #77");
+
+    syncSessionRefs(
+      [{ sessionId: "s4", currentRefs: getRefsForSessions(["s4"]).get("s4") }],
+      config,
+    );
+
+    expect(keysOf("s4")).toEqual(["ENG-1", "acme/app#77"]);
+  });
+
+  test("dryRun reports without writing, and without burning the watermark", () => {
+    addSession("s5");
+    addEntry("s5", "user", "fix WEB-7");
+
+    const dry = syncSessionRefs([{ sessionId: "s5" }], config, { dryRun: true });
+    expect(dry.updated).toBe(1);
+    expect(keysOf("s5")).toEqual([]);
+
+    const wet = syncSessionRefs([{ sessionId: "s5" }], config);
+    expect(wet.updated).toBe(1);
+    expect(keysOf("s5")).toEqual(["WEB-7"]);
+  });
+
+  test("rescan replaces refs rather than merging, so config changes take effect", () => {
+    addSession("s6");
+    addEntry("s6", "user", "ENT-9 and WEB-9");
+
+    // ENT is a configured prefix at first...
+    syncSessionRefs([{ sessionId: "s6" }], {
+      ...config,
+      linear: { prefixes: ["ENT", "WEB"], workspace: "acme" },
+    });
+    expect(keysOf("s6")).toEqual(["ENT-9", "WEB-9"]);
+
+    // ...and then isn't. A plain pass can't withdraw it — the entries are
+    // behind the watermark — but a rescan re-reads and replaces.
+    clearRefScanWatermarks(["s6"]);
+    syncSessionRefs(
+      [{ sessionId: "s6", currentRefs: getRefsForSessions(["s6"]).get("s6") }],
+      config,
+      { rescan: true },
+    );
+    expect(keysOf("s6")).toEqual(["WEB-9"]);
+  });
+
+  test("a non-draining pass caps how many sessions it catches up, newest first", () => {
+    // A workspace scanned for the first time can have hundreds waiting; the
+    // nav's list call must not pay for all of them at once.
+    const ids = Array.from({ length: 30 }, (_, i) => `cap${i}`);
+    for (const id of ids) {
+      addSession(id);
+      addEntry(id, "user", `working on WEB-${id.slice(3)}`);
+    }
+
+    const pass = syncSessionRefs(
+      ids.map((sessionId) => ({ sessionId })),
+      config,
+    );
+
+    expect(pass.updated).toBe(20);
+    expect(keysOf("cap0")).toEqual(["WEB-0"]);
+    expect(keysOf("cap29")).toEqual([]);
+
+    // The rest arrive on the next sweep.
+    const rest = syncSessionRefs(
+      ids.map((sessionId) => ({ sessionId })),
+      config,
+    );
+    expect(rest.updated).toBe(10);
+    expect(keysOf("cap29")).toEqual(["WEB-29"]);
+  });
+
+  test("rescan clears a session whose refs were all false positives", () => {
+    addSession("s8");
+    setSessionRefs("s8", [{ type: "github", key: "acme/app#9", label: "#9" }]);
+    addEntry("s8", "user", "[Image #9] look at this");
+
+    syncSessionRefs(
+      [{ sessionId: "s8", currentRefs: getRefsForSessions(["s8"]).get("s8") }],
+      config,
+      { rescan: true },
+    );
+
+    expect(keysOf("s8")).toEqual([]);
+  });
+
+  test("survives a database where memory has never ingested", () => {
+    getSessionDb().exec("DROP TABLE memory_transcript_entries");
+    addSession("s7");
+
+    const result = syncSessionRefs([{ sessionId: "s7", titleText: "look at WEB-3" }], config);
+
+    expect(result.updated).toBe(1);
+    expect(keysOf("s7")).toEqual(["WEB-3"]);
+  });
+});
+
+describe("backfillSessionRefs", () => {
+  beforeEach(() => {
+    prevDataDir = process.env.ANIMA_DATA_DIR;
+    dataDir = mkdtempSync(join(tmpdir(), "anima-ref-backfill-"));
+    process.env.ANIMA_DATA_DIR = dataDir;
+    closeDb();
+    closeSessionDb();
+    createTranscriptTable(getSessionDb());
+    workspaceId = createWorkspace({ name: "webapp", cwd: join(dataDir, "webapp") }).id;
+    entryId = 0;
+  });
+
+  afterEach(() => {
+    closeDb();
+    closeSessionDb();
+    if (prevDataDir === undefined) delete process.env.ANIMA_DATA_DIR;
+    else process.env.ANIMA_DATA_DIR = prevDataDir;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test("windows on when the conversation happened, not on last_activity", () => {
+    const recent = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    const old = new Date(Date.now() - 90 * 86_400_000).toISOString();
+
+    addSession("recent", recent);
+    addEntry("recent", "assistant", "shipped in #321", recent);
+
+    // Archived rows carry a `last_activity` of whenever they were archived, so
+    // an old conversation can look brand new by that column. Its messages are
+    // what date it.
+    addSession("old", old);
+    addEntry("old", "assistant", "shipped in #999", old);
+    getSessionDb()
+      .query("UPDATE sessions SET last_activity = ? WHERE provider_session_id = 'old'")
+      .run(new Date().toISOString());
+
+    const result = backfillSessionRefs(() => config, { days: 30 });
+
+    expect(result.sessions).toBe(1);
+    expect(keysOf("recent")).toEqual(["acme/app#321"]);
+    expect(keysOf("old")).toEqual([]);
+  });
+
+  test("drains a conversation longer than one pass's read budget", () => {
+    addSession("long");
+    for (let i = 0; i < 700; i++) addEntry("long", "user", `message ${i} with nothing in it`);
+    addEntry("long", "assistant", "and finally, ENG-42");
+
+    const result = backfillSessionRefs(() => config, { days: 30 });
+
+    expect(result.scanned).toBe(701);
+    expect(keysOf("long")).toEqual(["ENG-42"]);
+  });
+});

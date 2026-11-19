@@ -1,0 +1,22 @@
+{
+  "name": "@anima/agent-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsgo --noEmit -p ../../tsconfig.json"
+  },
+  "dependencies": {
+    "@anima/shared": "workspace:*",
+    "@anthropic-ai/claude-agent-sdk": "catalog:",
+    "@openai/codex-sdk": "0.123.0",
+    "sharp": "0.35.5",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

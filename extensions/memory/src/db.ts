@@ -1,0 +1,1137 @@
+/**
+ * Memory Extension — Database Access Layer
+ *
+ * Opens its own bun:sqlite connection to ~/.anima/anima.db.
+ * Safe for concurrent access: WAL mode + busy_timeout handles
+ * contention with the gateway's connection.
+ */
+
+import { Database } from "bun:sqlite";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const DEFAULT_DB_PATH = join(process.env.ANIMA_DATA_DIR || join(homedir(), ".anima"), "anima.db");
+let dbPath = DEFAULT_DB_PATH;
+
+let db: Database | null = null;
+
+export function getDb(): Database {
+  if (db) return db;
+
+  db = new Database(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("PRAGMA busy_timeout = 5000");
+
+  return db;
+}
+
+export function closeDb(): void {
+  if (db) {
+    db.close();
+    db = null;
+  }
+}
+
+/**
+ * Test helper to redirect the SQLite file path.
+ * Resets the active connection when changed.
+ */
+export function setDbPathForTests(path: string | null): void {
+  closeDb();
+  dbPath = path ?? DEFAULT_DB_PATH;
+}
+
+// ============================================================================
+// File States
+// ============================================================================
+
+export interface FileState {
+  filePath: string;
+  source: string;
+  status: "idle" | "ingesting";
+  lastModified: number;
+  fileSize: number;
+  lastProcessedOffset: number;
+  lastCommittedEntryId: number | null;
+  lastEntryTimestamp: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function getFileState(filePath: string): FileState | null {
+  const row = getDb()
+    .query(
+      `SELECT
+        file_path AS filePath,
+        source,
+        status,
+        last_modified AS lastModified,
+        file_size AS fileSize,
+        last_processed_offset AS lastProcessedOffset,
+        last_committed_entry_id AS lastCommittedEntryId,
+        last_entry_timestamp AS lastEntryTimestamp,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM memory_file_states WHERE file_path = ?`,
+    )
+    .get(filePath) as FileState | null;
+  return row;
+}
+
+/**
+ * Mark a file as ingesting — sets the high water mark (file_size)
+ * before we start reading. If the file is new, creates the row.
+ */
+export function markFileIngesting(state: {
+  filePath: string;
+  source: string;
+  lastModified: number;
+  fileSize: number;
+}): void {
+  getDb()
+    .query(
+      `INSERT INTO memory_file_states
+        (file_path, source, status, last_modified, file_size, updated_at)
+      VALUES (?, ?, 'ingesting', ?, ?, datetime('now'))
+      ON CONFLICT(file_path) DO UPDATE SET
+        source = excluded.source,
+        status = 'ingesting',
+        last_modified = excluded.last_modified,
+        file_size = excluded.file_size,
+        updated_at = datetime('now')`,
+    )
+    .run(state.filePath, state.source, state.lastModified, state.fileSize);
+}
+
+/**
+ * Mark a file as idle after successful ingestion.
+ * Updates offset and last entry timestamp atomically.
+ */
+export function markFileIdle(state: {
+  filePath: string;
+  lastProcessedOffset: number;
+  lastCommittedEntryId: number | null;
+  lastEntryTimestamp: string | null;
+}): void {
+  getDb()
+    .query(
+      `UPDATE memory_file_states SET
+        status = 'idle',
+        last_processed_offset = ?,
+        last_committed_entry_id = COALESCE(?, last_committed_entry_id),
+        last_entry_timestamp = COALESCE(?, last_entry_timestamp),
+        updated_at = datetime('now')
+      WHERE file_path = ?`,
+    )
+    .run(
+      state.lastProcessedOffset,
+      state.lastCommittedEntryId,
+      state.lastEntryTimestamp,
+      state.filePath,
+    );
+}
+
+// ============================================================================
+// Crash Recovery
+// ============================================================================
+
+/**
+ * Find all files stuck in 'ingesting' state (crashed mid-import).
+ */
+export function getStuckFiles(): FileState[] {
+  return getDb()
+    .query(
+      `SELECT
+        file_path AS filePath, source, status,
+        last_modified AS lastModified, file_size AS fileSize,
+        last_processed_offset AS lastProcessedOffset,
+        last_committed_entry_id AS lastCommittedEntryId,
+        last_entry_timestamp AS lastEntryTimestamp,
+        created_at AS createdAt, updated_at AS updatedAt
+      FROM memory_file_states
+      WHERE status = 'ingesting'`,
+    )
+    .all() as FileState[];
+}
+
+/**
+ * Roll back a stuck file: delete partially-imported entries
+ * (entries for this file with timestamp > last committed timestamp),
+ * then reset status to idle.
+ */
+export function rollbackStuckFile(
+  filePath: string,
+  lastCommittedEntryId: number | null,
+  lastEntryTimestamp: string | null,
+): number {
+  const d = getDb();
+  let deleted = 0;
+
+  if (lastCommittedEntryId !== null) {
+    // Precise rollback boundary, safe even when many entries share timestamps.
+    const result = d
+      .query(
+        `DELETE FROM memory_transcript_entries
+        WHERE source_file = ? AND id > ?`,
+      )
+      .run(filePath, lastCommittedEntryId);
+    deleted = result.changes;
+  } else if (lastEntryTimestamp) {
+    // Legacy fallback if no committed id is available.
+    const result = d
+      .query(
+        `DELETE FROM memory_transcript_entries
+        WHERE source_file = ? AND timestamp > ?`,
+      )
+      .run(filePath, lastEntryTimestamp);
+    deleted = result.changes;
+  } else {
+    // No previous timestamp = file was brand new, delete ALL entries for it
+    const result = d
+      .query("DELETE FROM memory_transcript_entries WHERE source_file = ?")
+      .run(filePath);
+    deleted = result.changes;
+  }
+
+  // Reset to idle (keep last_processed_offset at its pre-crash value)
+  d.query(
+    `UPDATE memory_file_states SET status = 'idle', updated_at = datetime('now')
+    WHERE file_path = ?`,
+  ).run(filePath);
+
+  return deleted;
+}
+
+// ============================================================================
+// Transcript Entries
+// ============================================================================
+
+export interface TranscriptEntryRow {
+  id: number;
+  sessionId: string;
+  sourceFile: string;
+  role: "user" | "assistant";
+  content: string;
+  toolNames: string | null;
+  timestamp: string;
+  cwd: string | null;
+  ingestedAt: string;
+}
+
+export interface InsertEntry {
+  sessionId: string;
+  sourceFile: string;
+  role: "user" | "assistant";
+  content: string;
+  toolNames: string | null;
+  timestamp: string;
+  cwd: string | null;
+}
+
+/**
+ * Bulk insert transcript entries (no transaction wrapper — caller manages transaction).
+ */
+export function insertTranscriptEntriesRaw(entries: InsertEntry[]): void {
+  if (entries.length === 0) return;
+
+  const d = getDb();
+  const stmt = d.prepare(
+    `INSERT INTO memory_transcript_entries
+      (session_id, source_file, role, content, tool_names, timestamp, cwd)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  for (const e of entries) {
+    stmt.run(e.sessionId, e.sourceFile, e.role, e.content, e.toolNames, e.timestamp, e.cwd);
+  }
+}
+
+/**
+ * Whether a transcript belongs to a session that isn't a conversation with
+ * the user: a subagent, or a legacy Codex task. Their work reaches memory
+ * through the summary they report to their parent, and their transcript stays
+ * readable in the session view, so Scribe leaves them out. Handoffs and
+ * unattended top-level runs are `chat` sessions and stay in.
+ *
+ * Reads the session extension's `sessions` table in the same database. A
+ * transcript with no row (a plain `claude` run outside Anima) is a chat, and a
+ * database without the table (standalone tests) excludes nothing.
+ */
+export function isNonChatSession(sessionId: string): boolean {
+  try {
+    const row = getDb()
+      .query("SELECT purpose FROM sessions WHERE provider_session_id = ?")
+      .get(sessionId) as { purpose: string } | null;
+    return row !== null && row.purpose !== "chat";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every folder of the workspace `cwd` belongs to, `cwd` first: its
+ * root, worktrees and added folders (inactive ones too: a moved folder's
+ * history is still the project's), plus the folders its chat sessions ran in,
+ * which is how subfolders count. Memory is per workspace, so a session in a
+ * worktree sees the conversations held in the root and the other way round.
+ *
+ * Reads the session extension's tables in the same database. A folder in no
+ * workspace, or a database without those tables (standalone tests), is just
+ * itself.
+ */
+export function workspaceFoldersFor(cwd: string): string[] {
+  try {
+    const d = getDb();
+    const owner = d
+      .query(
+        `SELECT workspace_id AS id FROM workspace_folders WHERE path = ?1
+         UNION ALL SELECT id FROM workspaces WHERE cwd = ?1
+         UNION ALL SELECT workspace_id FROM sessions WHERE cwd = ?1 AND purpose = 'chat'
+         LIMIT 1`,
+      )
+      .get(cwd) as { id: string } | null;
+    if (!owner) return [cwd];
+
+    const rows = d
+      .query(
+        `SELECT path FROM workspace_folders WHERE workspace_id = ?1
+         UNION SELECT cwd FROM workspaces WHERE id = ?1
+         UNION SELECT cwd FROM sessions
+          WHERE workspace_id = ?1 AND purpose = 'chat' AND cwd IS NOT NULL
+            AND cwd NOT IN (SELECT path FROM workspace_folders WHERE workspace_id != ?1)`,
+      )
+      .all(owner.id) as { path: string }[];
+    return [...new Set([cwd, ...rows.map((row) => row.path)])];
+  } catch {
+    return [cwd];
+  }
+}
+
+/**
+ * Take a transcript file back out of memory: its entries, and conversations
+ * Scribe hasn't started on. Archived summaries (already written) and one it is
+ * processing right now are left alone. Caller manages the transaction.
+ */
+export function purgeFileFromMemory(sourceFile: string): {
+  entries: number;
+  conversations: number;
+} {
+  const d = getDb();
+  const entries = d
+    .query("DELETE FROM memory_transcript_entries WHERE source_file = ?")
+    .run(sourceFile).changes;
+  const conversations = d
+    .query(
+      `DELETE FROM memory_conversations
+       WHERE source_file = ? AND status IN ('active', 'ready', 'queued')`,
+    )
+    .run(sourceFile).changes;
+  return { entries, conversations };
+}
+
+/**
+ * Delete all entries for a given source file (for re-import).
+ */
+export function deleteEntriesForFile(sourceFile: string): number {
+  const result = getDb()
+    .query("DELETE FROM memory_transcript_entries WHERE source_file = ?")
+    .run(sourceFile);
+  return result.changes;
+}
+
+// ============================================================================
+// Conversations
+// ============================================================================
+
+export interface ConversationRow {
+  id: number;
+  sessionId: string;
+  sourceFile: string;
+  firstMessageAt: string;
+  lastMessageAt: string;
+  entryCount: number;
+  status: string;
+  strategy: string | null;
+  summary: string | null;
+  processedAt: string | null;
+  statusAt: string | null;
+  metadata: string | null;
+  createdAt: string;
+}
+
+export function upsertConversation(conv: {
+  sessionId: string;
+  sourceFile: string;
+  firstMessageAt: string;
+  lastMessageAt: string;
+  entryCount: number;
+}): number | null {
+  // If this conversation is already past 'active' (ready, queued, processing, archived, skipped),
+  // don't touch it — it's already in the pipeline or done.
+  const alreadyInPipeline = getDb()
+    .query(
+      `SELECT id FROM memory_conversations
+      WHERE source_file = ?
+        AND first_message_at = ?
+        AND status != 'active'
+      LIMIT 1`,
+    )
+    .get(conv.sourceFile, conv.firstMessageAt) as { id: number } | null;
+
+  if (alreadyInPipeline) return null;
+
+  // Match existing active conversation by source_file + first_message_at
+  const existing = getDb()
+    .query(
+      `SELECT id FROM memory_conversations
+      WHERE source_file = ? AND first_message_at = ? AND status = 'active'
+      LIMIT 1`,
+    )
+    .get(conv.sourceFile, conv.firstMessageAt) as { id: number } | null;
+
+  if (existing) {
+    getDb()
+      .query(
+        `UPDATE memory_conversations
+        SET last_message_at = ?, entry_count = ?
+        WHERE id = ?`,
+      )
+      .run(conv.lastMessageAt, conv.entryCount, existing.id);
+    return existing.id;
+  } else {
+    const result = getDb()
+      .query(
+        `INSERT INTO memory_conversations
+          (session_id, source_file, first_message_at, last_message_at, entry_count)
+        VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        conv.sessionId,
+        conv.sourceFile,
+        conv.firstMessageAt,
+        conv.lastMessageAt,
+        conv.entryCount,
+      );
+    return result.lastInsertRowid as number;
+  }
+}
+
+export function markConversationsReady(gapMinutes: number): number {
+  const result = getDb()
+    .query(
+      `UPDATE memory_conversations
+      SET status = 'ready'
+      WHERE status = 'active'
+        AND datetime(last_message_at, '+' || ? || ' minutes') < datetime('now')`,
+    )
+    .run(gapMinutes);
+  return result.changes;
+}
+
+export function getReadyConversations(): ConversationRow[] {
+  return getDb()
+    .query(
+      `SELECT
+        id, session_id AS sessionId, source_file AS sourceFile,
+        first_message_at AS firstMessageAt,
+        last_message_at AS lastMessageAt, entry_count AS entryCount,
+        status, strategy, summary, processed_at AS processedAt,
+        status_at AS statusAt, metadata,
+        created_at AS createdAt
+      FROM memory_conversations
+      WHERE status = 'ready'
+      ORDER BY first_message_at ASC`,
+    )
+    .all() as ConversationRow[];
+}
+
+export function updateConversationStatus(
+  id: number,
+  status: string,
+  metadata?: Record<string, unknown>,
+): void {
+  if (metadata) {
+    getDb()
+      .query(
+        "UPDATE memory_conversations SET status = ?, status_at = datetime('now'), metadata = ? WHERE id = ?",
+      )
+      .run(status, JSON.stringify(metadata), id);
+  } else {
+    getDb()
+      .query("UPDATE memory_conversations SET status = ?, status_at = datetime('now') WHERE id = ?")
+      .run(status, id);
+  }
+}
+
+/**
+ * Delete conversations for a source file (for re-import rebuild).
+ * Only deletes active/ready ones — leaves archived alone.
+ */
+export function deleteActiveConversationsForFile(sourceFile: string): number {
+  const result = getDb()
+    .query("DELETE FROM memory_conversations WHERE source_file = ? AND status = 'active'")
+    .run(sourceFile);
+  return result.changes;
+}
+
+// ============================================================================
+// Scribe Processing (Phase 2)
+// ============================================================================
+
+/**
+ * Get all transcript entries belonging to a specific conversation.
+ * Uses the conversation's source_file + timestamp range to scope entries.
+ */
+export function getEntriesForConversation(conversationId: number): TranscriptEntryRow[] {
+  const d = getDb();
+  const conv = d
+    .query(
+      `SELECT source_file, first_message_at, last_message_at
+       FROM memory_conversations WHERE id = ?`,
+    )
+    .get(conversationId) as {
+    source_file: string;
+    first_message_at: string;
+    last_message_at: string;
+  } | null;
+
+  if (!conv) return [];
+
+  return d
+    .query(
+      `SELECT
+        id, session_id AS sessionId, source_file AS sourceFile,
+        role, content, tool_names AS toolNames, timestamp,
+        cwd, ingested_at AS ingestedAt
+      FROM memory_transcript_entries
+      WHERE source_file = ?
+        AND timestamp >= ?
+        AND timestamp <= ?
+      ORDER BY timestamp ASC, id ASC`,
+    )
+    .all(conv.source_file, conv.first_message_at, conv.last_message_at) as TranscriptEntryRow[];
+}
+
+/**
+ * Mark a conversation as processed by Scribe.
+ * Sets status, summary, and processed_at timestamp.
+ */
+export function updateConversationProcessed(
+  id: number,
+  status: "archived" | "skipped" | "review",
+  summary: string | null,
+  filesWritten?: string[],
+): void {
+  getDb()
+    .query(
+      `UPDATE memory_conversations
+       SET status = ?, summary = ?, files_written = ?, processed_at = datetime('now')
+       WHERE id = ?`,
+    )
+    .run(status, summary, filesWritten ? JSON.stringify(filesWritten) : null, id);
+}
+
+/**
+ * Get recent archived conversations from the same source file, for context.
+ * Returns the most recent N conversations processed before this one.
+ */
+export function getPreviousConversationContext(
+  sourceFile: string,
+  beforeTimestamp: string,
+  limit = 2,
+): Array<{ id: number; summary: string | null; filesWritten: string[]; date: string }> {
+  const rows = getDb()
+    .query(
+      `SELECT id, summary, files_written AS filesWritten, first_message_at AS date
+       FROM memory_conversations
+       WHERE source_file = ? AND status = 'archived' AND last_message_at < ?
+       ORDER BY last_message_at DESC
+       LIMIT ?`,
+    )
+    .all(sourceFile, beforeTimestamp, limit) as Array<{
+    id: number;
+    summary: string | null;
+    filesWritten: string | null;
+    date: string;
+  }>;
+
+  return rows.map((r) => ({
+    id: r.id,
+    summary: r.summary,
+    filesWritten: r.filesWritten ? (JSON.parse(r.filesWritten) as string[]) : [],
+    date: r.date.slice(0, 10),
+  }));
+}
+
+/**
+ * Get conversations currently in "processing" state with their metadata.
+ * Used on startup to check if their runtime sessions are still alive.
+ */
+export function getProcessingConversations(): Array<{
+  id: number;
+  sessionId: string | null;
+}> {
+  const rows = getDb()
+    .query("SELECT id, metadata FROM memory_conversations WHERE status = 'processing'")
+    .all() as Array<{ id: number; metadata: string | null }>;
+
+  return rows.map((r) => {
+    let sessionId: string | null = null;
+    if (r.metadata) {
+      try {
+        const meta = JSON.parse(r.metadata);
+        sessionId = meta.sessionId ?? meta.ccSessionId ?? null;
+      } catch {
+        /* ignore parse errors */
+      }
+    }
+    return { id: r.id, sessionId };
+  });
+}
+
+/**
+ * Reset a specific conversation from "processing" back to "queued".
+ */
+export function resetConversationToQueued(id: number): void {
+  getDb()
+    .query(
+      "UPDATE memory_conversations SET status = 'queued' WHERE id = ? AND status = 'processing'",
+    )
+    .run(id);
+}
+
+/**
+ * Queue up to `limit` ready conversations for Scribe to process.
+ * Returns the number of conversations queued.
+ */
+export function queueConversations(limit: number): number {
+  const d = getDb();
+
+  // Select IDs first, then update — bun:sqlite doesn't reliably bind
+  // LIMIT params inside subqueries of UPDATE statements.
+  const ids = d
+    .query(
+      `SELECT id FROM memory_conversations
+       WHERE status = 'ready'
+       ORDER BY first_message_at ASC
+       LIMIT ?`,
+    )
+    .all(limit) as Array<{ id: number }>;
+
+  if (ids.length === 0) return 0;
+
+  const placeholders = ids.map(() => "?").join(",");
+  const result = d
+    .query(
+      `UPDATE memory_conversations
+       SET status = 'queued', status_at = datetime('now')
+       WHERE id IN (${placeholders})`,
+    )
+    .run(...ids.map((r) => r.id));
+  return result.changes;
+}
+
+/**
+ * Get the next queued conversation (oldest first).
+ */
+export function getNextQueued(): ConversationRow | null {
+  return getDb()
+    .query(
+      `SELECT
+        id, session_id AS sessionId, source_file AS sourceFile,
+        first_message_at AS firstMessageAt,
+        last_message_at AS lastMessageAt, entry_count AS entryCount,
+        status, strategy, summary, processed_at AS processedAt,
+        status_at AS statusAt, metadata,
+        created_at AS createdAt
+      FROM memory_conversations
+      WHERE status = 'queued'
+      ORDER BY first_message_at ASC
+      LIMIT 1`,
+    )
+    .get() as ConversationRow | null;
+}
+
+/**
+ * Get conversations in the Scribe pipeline (for health check display).
+ * Includes processing, queued, ready, and active — sorted by pipeline priority.
+ */
+export function getActiveWorkItems(): ConversationRow[] {
+  return getDb()
+    .query(
+      `SELECT
+        id, session_id AS sessionId, source_file AS sourceFile,
+        first_message_at AS firstMessageAt,
+        last_message_at AS lastMessageAt, entry_count AS entryCount,
+        status, strategy, summary, processed_at AS processedAt,
+        status_at AS statusAt, metadata,
+        created_at AS createdAt
+      FROM memory_conversations
+      WHERE status IN ('processing', 'queued', 'ready', 'active')
+      ORDER BY
+        CASE status
+          WHEN 'processing' THEN 0
+          WHEN 'queued' THEN 1
+          WHEN 'ready' THEN 2
+          WHEN 'active' THEN 3
+        END,
+        first_message_at ASC`,
+    )
+    .all() as ConversationRow[];
+}
+
+/**
+ * Get the count of queued conversations.
+ */
+export function getQueuedCount(): number {
+  return (
+    getDb()
+      .query("SELECT count(*) AS n FROM memory_conversations WHERE status = 'queued'")
+      .get() as { n: number }
+  ).n;
+}
+
+// ============================================================================
+// Session Continuity
+// ============================================================================
+
+/**
+ * Transition all active conversations for a workspace directly to 'queued'.
+ * Skips the 'ready' intermediate state so Scribe picks them up immediately.
+ * Matches by source_file pattern (encoded CWD) so ALL active conversations
+ * for the workspace enter the Scribe pipeline, not just the current session's.
+ */
+export function transitionActiveConversationsByCwd(sourceFilePatterns: string[]): number {
+  if (sourceFilePatterns.length === 0) return 0;
+  const result = getDb()
+    .query(
+      `UPDATE memory_conversations
+       SET status = 'queued', status_at = datetime('now')
+       WHERE (${likeAny(sourceFilePatterns)}) AND status = 'active'`,
+    )
+    .run(...sourceFilePatterns);
+  return result.changes;
+}
+
+/** `source_file LIKE ? OR …`, one per pattern. */
+function likeAny(patterns: string[]): string {
+  return patterns.map(() => "source_file LIKE ?").join(" OR ");
+}
+
+/**
+ * Get the most recent transcript entries across all sessions in a workspace's
+ * folders (`workspaceFoldersFor`). Queries by the `cwd` column (absolute
+ * path) directly. Returns entries in chronological order (oldest first).
+ */
+export function getRecentTranscriptEntries(
+  cwds: string[],
+  limit: number,
+): Array<{ role: string; content: string; timestamp: string }> {
+  if (cwds.length === 0) return [];
+  const rows = getDb()
+    .query(
+      `SELECT role, content, timestamp
+       FROM memory_transcript_entries
+       WHERE cwd IN (${cwds.map(() => "?").join(",")}) AND tool_names IS NULL
+       ORDER BY timestamp DESC, id DESC
+       LIMIT ?`,
+    )
+    .all(...cwds, limit) as Array<{ role: string; content: string; timestamp: string }>;
+
+  // Reverse to chronological order
+  return rows.reverse();
+}
+
+/**
+ * Get recent archived conversation summaries matching any of the source file
+ * patterns (one per workspace folder). A pattern matches the encoded CWD in
+ * the source_file path
+ * (e.g., '%encoded-cwd%' matches '~/.claude/projects/-home-alex-Projects-foo/UUID.jsonl').
+ *
+ * Returns in chronological order (oldest first) so the injected context reads
+ * naturally: earlier sessions listed first, most recent last.
+ */
+export function getRecentArchivedSummaries(
+  sourceFilePatterns: string[],
+  limit: number,
+): Array<{ summary: string; firstMessageAt: string; lastMessageAt: string }> {
+  if (sourceFilePatterns.length === 0) return [];
+  // Subquery grabs the N most recent, outer query re-sorts chronologically
+  return getDb()
+    .query(
+      `SELECT summary, firstMessageAt, lastMessageAt FROM (
+         SELECT summary, first_message_at AS firstMessageAt, last_message_at AS lastMessageAt
+         FROM memory_conversations
+         WHERE (${likeAny(sourceFilePatterns)})
+           AND status = 'archived'
+           AND summary IS NOT NULL
+           AND length(summary) > 0
+         ORDER BY last_message_at DESC
+         LIMIT ?
+       ) ORDER BY lastMessageAt ASC`,
+    )
+    .all(...sourceFilePatterns, limit) as Array<{
+    summary: string;
+    firstMessageAt: string;
+    lastMessageAt: string;
+  }>;
+}
+
+// ============================================================================
+// Memory Documents + FTS Search
+// ============================================================================
+
+export function upsertMemoryDocument(doc: {
+  filePath: string;
+  category: string;
+  title: string;
+  content: string;
+  fileModifiedAt: string;
+  cwd?: string;
+}): void {
+  getDb()
+    .query(
+      `INSERT OR REPLACE INTO memory_documents
+        (file_path, category, title, content, file_modified_at, cwd, ingested_at)
+      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
+    )
+    .run(doc.filePath, doc.category, doc.title, doc.content, doc.fileModifiedAt, doc.cwd ?? "");
+}
+
+/**
+ * Get the stored file_modified_at for a document.
+ * Used to skip re-ingestion of unchanged files on restart.
+ */
+export function getMemoryDocumentMtime(filePath: string): string | null {
+  const row = getDb()
+    .query("SELECT file_modified_at FROM memory_documents WHERE file_path = ?")
+    .get(filePath) as { file_modified_at: string } | null;
+  return row?.file_modified_at ?? null;
+}
+
+export interface SearchResult {
+  content: string;
+  sourceType: string;
+  sourceId: string;
+  cwd: string;
+  timestamp: string;
+  category: string;
+  rank: number;
+}
+
+/**
+ * Full-text search across conversation summaries and memory documents.
+ * Uses FTS5 with BM25 ranking.
+ */
+export function searchMemory(
+  query: string,
+  opts?: {
+    limit?: number;
+    category?: string;
+    cwd?: string;
+    dateFrom?: string;
+    dateTo?: string;
+  },
+): SearchResult[] {
+  const limit = opts?.limit ?? 20;
+
+  // Build WHERE clauses for filters
+  const conditions: string[] = ["memory_search_fts MATCH ?"];
+  const params: (string | number)[] = [query];
+
+  if (opts?.category) {
+    conditions.push("category = ?");
+    params.push(opts.category);
+  }
+
+  if (opts?.cwd) {
+    conditions.push("cwd = ?");
+    params.push(opts.cwd);
+  }
+
+  if (opts?.dateFrom) {
+    conditions.push("timestamp >= ?");
+    params.push(opts.dateFrom);
+  }
+
+  if (opts?.dateTo) {
+    conditions.push("timestamp <= ?");
+    params.push(opts.dateTo);
+  }
+
+  params.push(limit);
+
+  const whereClause = conditions.join(" AND ");
+
+  return getDb()
+    .query(
+      `SELECT
+        content, source_type AS sourceType, source_id AS sourceId,
+        cwd, timestamp, category, rank
+      FROM memory_search_fts
+      WHERE ${whereClause}
+      ORDER BY rank
+      LIMIT ?`,
+    )
+    .all(...params) as SearchResult[];
+}
+
+export interface TranscriptSearchHit {
+  /** Claude Code session id — the join key back to the session extension's rows. */
+  sessionId: string;
+  cwd: string;
+  /** Most recent matching message in the session. */
+  timestamp: string;
+  /** Highlighted excerpt from the best-matching message. */
+  snippet: string;
+  role: "user" | "assistant";
+  /** Matching messages in this session — a rough "how much of it is about this". */
+  matches: number;
+  /** bm25 of the best match. Negative; lower is better. */
+  rank: number;
+}
+
+/**
+ * How many matching messages are considered before grouping into sessions.
+ *
+ * The result list is per-session, but bm25 ranks per-message, so the grouping
+ * has to happen after the match. This bounds that work: a very common term can
+ * match a large share of all messages, and reading all of them to return 20
+ * sessions costs seconds instead of the fraction of a second this ceiling
+ * gives.
+ *
+ * The cost is a long-tail bias — a session with one weak mention of a very
+ * common term can fall outside the window. That's the right trade for a search
+ * box: the sessions you're looking for rank near the top or the query is too
+ * broad to be useful anyway.
+ */
+const TRANSCRIPT_MATCH_WINDOW = 500;
+
+/**
+ * Full-text search across transcript messages, grouped into sessions.
+ *
+ * Reads `memory_transcript_fts` — an external-content index over
+ * `memory_transcript_entries`, so the content is never duplicated and the
+ * snippet comes straight from the stored message (see migration 023).
+ */
+export function searchTranscripts(
+  query: string,
+  opts?: {
+    limit?: number;
+    cwd?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    /** Restrict to these sessions — how a ref filter is applied by the caller. */
+    sessionIds?: readonly string[];
+  },
+): TranscriptSearchHit[] {
+  const limit = opts?.limit ?? 20;
+
+  const conditions: string[] = [];
+  const params: (string | number)[] = [query, TRANSCRIPT_MATCH_WINDOW];
+
+  if (opts?.cwd) {
+    conditions.push("e.cwd = ?");
+    params.push(opts.cwd);
+  }
+  if (opts?.dateFrom) {
+    conditions.push("e.timestamp >= ?");
+    params.push(opts.dateFrom);
+  }
+  if (opts?.dateTo) {
+    conditions.push("e.timestamp <= ?");
+    params.push(opts.dateTo);
+  }
+  if (opts?.sessionIds) {
+    // An empty allow-list means "no session qualifies", not "no filter".
+    if (opts.sessionIds.length === 0) return [];
+    conditions.push(`e.session_id IN (${opts.sessionIds.map(() => "?").join(",")})`);
+    params.push(...opts.sessionIds);
+  }
+
+  params.push(limit);
+  const filters = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  return getDb()
+    .query(
+      `WITH hits AS (
+         SELECT rowid AS entry_id,
+                bm25(memory_transcript_fts) AS rank,
+                snippet(memory_transcript_fts, 0, '«', '»', '…', 14) AS snippet
+           FROM memory_transcript_fts
+          WHERE memory_transcript_fts MATCH ?
+          ORDER BY rank
+          LIMIT ?
+       ),
+       joined AS (
+         SELECT e.session_id, e.cwd, e.timestamp, e.role, h.rank, h.snippet
+           FROM hits h
+           JOIN memory_transcript_entries e ON e.id = h.entry_id
+           ${filters}
+       ),
+       ranked AS (
+         -- Window functions rather than GROUP BY: the row's snippet and role
+         -- have to come from the *best-ranked* message, and SQLite only
+         -- guarantees that pairing for bare columns when a query has exactly
+         -- one min/max aggregate. This query needs three.
+         SELECT session_id, cwd, role, rank, snippet,
+                ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY rank)  AS rn,
+                COUNT(*)     OVER (PARTITION BY session_id)                AS matches,
+                MAX(timestamp) OVER (PARTITION BY session_id)              AS last_at
+           FROM joined
+       )
+       SELECT session_id        AS sessionId,
+              COALESCE(cwd, '') AS cwd,
+              last_at           AS timestamp,
+              matches, rank, snippet, role
+         FROM ranked
+        WHERE rn = 1
+        ORDER BY rank
+        LIMIT ?`,
+    )
+    .all(...params) as TranscriptSearchHit[];
+}
+
+/**
+ * Check if the FTS table exists (for graceful degradation).
+ */
+export function ftsTableExists(): boolean {
+  try {
+    getDb().query("SELECT count(*) FROM memory_search_fts LIMIT 1").get();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Same, for the transcript index (migration 023). */
+export function transcriptFtsExists(): boolean {
+  try {
+    getDb().query("SELECT rowid FROM memory_transcript_fts LIMIT 1").get();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================================
+// Stats
+// ============================================================================
+
+export interface MemoryStats {
+  fileCount: number;
+  entryCount: number;
+  conversationsByStatus: Record<string, number>;
+}
+
+export function getStats(): MemoryStats {
+  const d = getDb();
+
+  const fileCount = (d.query("SELECT count(*) AS n FROM memory_file_states").get() as { n: number })
+    .n;
+
+  const entryCount = (
+    d.query("SELECT count(*) AS n FROM memory_transcript_entries").get() as { n: number }
+  ).n;
+
+  const statusRows = d
+    .query("SELECT status, count(*) AS n FROM memory_conversations GROUP BY status")
+    .all() as Array<{ status: string; n: number }>;
+
+  const conversationsByStatus: Record<string, number> = {};
+  for (const row of statusRows) {
+    conversationsByStatus[row.status] = row.n;
+  }
+
+  return { fileCount, entryCount, conversationsByStatus };
+}
+
+// ============================================================================
+// Calendar & Timeline Queries (for Memory UI pages)
+// ============================================================================
+
+export interface CalendarDay {
+  date: string; // YYYY-MM-DD
+  conversationCount: number;
+  totalEntries: number;
+  archivedCount: number;
+}
+
+/**
+ * Get conversation counts grouped by day for a given month (YYYY-MM).
+ * Returns one row per day that has any conversations.
+ */
+export function getCalendarData(yearMonth: string): CalendarDay[] {
+  const d = getDb();
+  return d
+    .query(
+      `SELECT
+        date(first_message_at) AS date,
+        count(*) AS conversationCount,
+        sum(entry_count) AS totalEntries,
+        sum(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) AS archivedCount
+      FROM memory_conversations
+      WHERE date(first_message_at) LIKE ? || '%'
+        AND status NOT IN ('skipped')
+      GROUP BY date(first_message_at)
+      ORDER BY date ASC`,
+    )
+    .all(yearMonth) as CalendarDay[];
+}
+
+export interface DayConversation {
+  id: number;
+  sessionId: string;
+  sourceFile: string;
+  firstMessageAt: string;
+  lastMessageAt: string;
+  entryCount: number;
+  status: string;
+  summary: string | null;
+  metadata: string | null;
+}
+
+/**
+ * Get all conversations for a specific day, ordered by time.
+ */
+export function getDayConversations(date: string): DayConversation[] {
+  const d = getDb();
+  return d
+    .query(
+      `SELECT
+        id,
+        session_id AS sessionId,
+        source_file AS sourceFile,
+        first_message_at AS firstMessageAt,
+        last_message_at AS lastMessageAt,
+        entry_count AS entryCount,
+        status,
+        summary,
+        metadata
+      FROM memory_conversations
+      WHERE date(first_message_at) = ?
+        AND status NOT IN ('skipped')
+      ORDER BY first_message_at ASC`,
+    )
+    .all(date) as DayConversation[];
+}
+
+/**
+ * Get the range of months that have conversation data.
+ */
+export function getMonthRange(): { earliest: string; latest: string } | null {
+  const d = getDb();
+  const row = d
+    .query(
+      `SELECT
+        min(date(first_message_at)) AS earliest,
+        max(date(first_message_at)) AS latest
+      FROM memory_conversations
+      WHERE status NOT IN ('skipped')`,
+    )
+    .get() as { earliest: string | null; latest: string | null } | null;
+
+  if (!row?.earliest || !row?.latest) return null;
+  return { earliest: row.earliest, latest: row.latest };
+}

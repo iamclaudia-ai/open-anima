@@ -1,0 +1,14 @@
+{
+  "name": "@anima/watchdog",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "build": "bun build --compile src/index.ts --outfile dist/anima-watchdog && bun run sign",
+    "sign": "sh scripts/sign.sh dist/anima-watchdog",
+    "deploy": "bun run build && mkdir -p \"${ANIMA_DATA_DIR:-$HOME/.anima}/bin\" && install -m 700 dist/anima-watchdog \"${ANIMA_DATA_DIR:-$HOME/.anima}/bin/watchdog\" && echo \"Deployed to ${ANIMA_DATA_DIR:-$HOME/.anima}/bin/watchdog (reload its LaunchAgent to pick it up)\""
+  },
+  "dependencies": {
+    "@anima/shared": "workspace:*"
+  }
+}

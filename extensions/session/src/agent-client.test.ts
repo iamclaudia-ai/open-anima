@@ -1,0 +1,299 @@
+import { describe, expect, it } from "bun:test";
+import { createServer } from "node:net";
+import { AgentHostClient } from "./agent-client";
+
+async function getFreePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = createServer();
+    const timer = setTimeout(() => {
+      try {
+        server.close();
+      } catch {
+        // ignore
+      }
+      reject(new Error("Timed out reserving free port"));
+    }, 3000);
+    server.listen(0, "127.0.0.1", () => {
+      clearTimeout(timer);
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Failed to reserve free port"));
+        return;
+      }
+      const port = address.port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5000, stepMs = 10): Promise<void> {
+  const start = Date.now();
+  while (!predicate() && Date.now() - start < timeoutMs) {
+    await Bun.sleep(stepMs);
+  }
+  if (!predicate()) {
+    throw new Error("Timed out waiting for condition");
+  }
+}
+
+describe("AgentHostClient", () => {
+  it("sends requests and resolves responses", async () => {
+    const port = await getFreePort();
+    const server = Bun.serve({
+      port,
+      fetch(req, server) {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws") {
+          server.upgrade(req);
+          return undefined;
+        }
+        return new Response("Not Found", { status: 404 });
+      },
+      websocket: {
+        message(ws, message) {
+          const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+          const msg = JSON.parse(raw) as Record<string, unknown>;
+          if (msg.type === "session.create") {
+            ws.send(
+              JSON.stringify({
+                type: "res",
+                requestId: msg.requestId,
+                ok: true,
+                payload: { sessionId: "s1" },
+              }),
+            );
+          } else if (msg.type === "session.prompt") {
+            ws.send(JSON.stringify({ type: "res", requestId: msg.requestId, ok: true }));
+          } else if (msg.type === "session.list") {
+            ws.send(
+              JSON.stringify({ type: "res", requestId: msg.requestId, ok: true, payload: [] }),
+            );
+          } else if (msg.type === "auth") {
+            // no-op
+          }
+        },
+      },
+    });
+
+    const client = new AgentHostClient(`ws://127.0.0.1:${port}/ws`);
+    await client.connect();
+
+    const created = await client.createSession({ cwd: "/repo", profile: "yolo" });
+    expect(created).toEqual({ sessionId: "s1" });
+
+    await expect(
+      client.prompt("s1", "hi", undefined, undefined, undefined, "yolo"),
+    ).resolves.toBeUndefined();
+    await expect(client.list()).resolves.toEqual([]);
+
+    client.disconnect();
+    server.stop();
+  });
+
+  it("rejects on error responses", async () => {
+    const port = await getFreePort();
+    const server = Bun.serve({
+      port,
+      fetch(req, server) {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws") {
+          server.upgrade(req);
+          return undefined;
+        }
+        return new Response("Not Found", { status: 404 });
+      },
+      websocket: {
+        message(ws, message) {
+          const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+          const msg = JSON.parse(raw) as Record<string, unknown>;
+          if (msg.type === "session.prompt") {
+            ws.send(
+              JSON.stringify({
+                type: "res",
+                requestId: msg.requestId,
+                ok: false,
+                error: "boom",
+              }),
+            );
+          }
+        },
+      },
+    });
+
+    const client = new AgentHostClient(`ws://127.0.0.1:${port}/ws`);
+    await client.connect();
+
+    await expect(
+      client.prompt("s1", "hi", undefined, undefined, undefined, "yolo"),
+    ).rejects.toThrow("boom");
+
+    client.disconnect();
+    server.stop();
+  });
+
+  it("reconnects with resume sessions after event delivery", async () => {
+    const port = await getFreePort();
+    const auths: Array<Record<string, unknown>> = [];
+    let latestWs: { send: (data: string) => void; close: () => void } | null = null;
+
+    const server = Bun.serve({
+      port,
+      fetch(req, server) {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws") {
+          server.upgrade(req);
+          return undefined;
+        }
+        return new Response("Not Found", { status: 404 });
+      },
+      websocket: {
+        open(ws) {
+          latestWs = ws as unknown as { send: (data: string) => void; close: () => void };
+        },
+        message(ws, message) {
+          const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+          const msg = JSON.parse(raw) as Record<string, unknown>;
+          if (msg.type === "auth") {
+            auths.push(msg);
+          }
+          if (msg.type === "session.create") {
+            ws.send(
+              JSON.stringify({
+                type: "res",
+                requestId: msg.requestId,
+                ok: true,
+                payload: { sessionId: "s1" },
+              }),
+            );
+          }
+        },
+      },
+    });
+
+    const client = new AgentHostClient(`ws://127.0.0.1:${port}/ws`);
+    const events: Array<Record<string, unknown>> = [];
+    client.on("session.event", (payload) => events.push(payload as Record<string, unknown>));
+
+    await client.connect();
+    await client.createSession({ cwd: "/repo", profile: "yolo" });
+
+    (latestWs as { send: (data: string) => void } | null)?.send(
+      JSON.stringify({
+        type: "session.event",
+        sessionId: "s1",
+        event: { type: "content_block_delta", delta: { text: "hi" } },
+        seq: 3,
+      }),
+    );
+
+    await waitFor(() => events.length === 1);
+    (latestWs as { close: () => void } | null)?.close();
+
+    await waitFor(() => auths.length >= 2, 5000);
+    const resume = auths[1].resumeSessions as Array<{ sessionId: string; lastSeq: number }>;
+    expect(resume).toEqual([{ sessionId: "s1", lastSeq: 3 }]);
+
+    client.disconnect();
+    server.stop();
+  });
+
+  // The failure this prevents was silent by construction. agent-host
+  // broadcasts a session's events only to clients subscribed to it, and a
+  // dropped broadcast raises nothing anywhere — so a reload mid-turn left the
+  // extension subscribed to nothing, the CLI's `turn_stop` went to no one, and
+  // the session's row sat on `running` forever with no error to find.
+  it("re-subscribes wanted sessions on reconnect, without asking for a replay", async () => {
+    const port = await getFreePort();
+    const auths: Array<Record<string, unknown>> = [];
+    const subscribes: Array<Record<string, unknown>> = [];
+    let latestWs: { send: (data: string) => void; close: () => void } | null = null;
+
+    const server = Bun.serve({
+      port,
+      fetch(req, server) {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws") {
+          server.upgrade(req);
+          return undefined;
+        }
+        return new Response("Not Found", { status: 404 });
+      },
+      websocket: {
+        open(ws) {
+          latestWs = ws as unknown as { send: (data: string) => void; close: () => void };
+        },
+        message(ws, message) {
+          const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+          const msg = JSON.parse(raw) as Record<string, unknown>;
+          if (msg.type === "auth") auths.push(msg);
+          if (msg.type === "session.subscribe") {
+            subscribes.push(msg);
+            ws.send(
+              JSON.stringify({ type: "res", requestId: msg.requestId, ok: true, payload: {} }),
+            );
+          }
+        },
+      },
+    });
+
+    const client = new AgentHostClient(`ws://127.0.0.1:${port}/ws`);
+    await client.connect();
+
+    // What a freshly-started extension does: ask agent-host what is alive, then
+    // subscribe to it. No events have been seen, so there is no sequence to
+    // resume from — the case `resumeSessions` structurally cannot cover.
+    await client.subscribeSessions(["s_live"]);
+    await waitFor(() => subscribes.length === 1);
+
+    (latestWs as { close: () => void } | null)?.close();
+    await waitFor(() => auths.length >= 2, 5000);
+    await waitFor(() => subscribes.length >= 2, 5000);
+
+    // Still wanted after the reconnect...
+    expect(subscribes[1]?.sessionIds).toEqual(["s_live"]);
+    // ...and still no replay: re-delivering a turn's buffered deltas would
+    // duplicate them into a chat that already rendered them.
+    expect(auths[1]?.resumeSessions).toBeUndefined();
+
+    client.disconnect();
+    server.stop();
+  });
+
+  it("retries in background when the initial connect fails", async () => {
+    // Reproduces the startup race we hit in production: agent-host's WS isn't
+    // listening yet when the extension boots, so the first connect() rejects.
+    // Without the fix, scheduleReconnect was only wired into the
+    // already-open path, so the extension stayed disconnected forever.
+    const port = await getFreePort();
+    const client = new AgentHostClient(`ws://127.0.0.1:${port}/ws`, "session", 50);
+
+    await expect(client.connect()).rejects.toThrow();
+    expect(client.isConnected).toBe(false);
+
+    // Start the server after the initial failure; the background reconnect
+    // loop should pick it up on the next backoff tick.
+    const server = Bun.serve({
+      port,
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws") {
+          srv.upgrade(req);
+          return undefined;
+        }
+        return new Response("Not Found", { status: 404 });
+      },
+      websocket: {
+        message(_ws, _message) {
+          // auth — no-op
+        },
+      },
+    });
+
+    await waitFor(() => client.isConnected, 5000);
+    expect(client.isConnected).toBe(true);
+
+    client.disconnect();
+    server.stop();
+  });
+});

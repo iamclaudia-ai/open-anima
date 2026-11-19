@@ -1,0 +1,494 @@
+/**
+ * Extension Manager
+ *
+ * Loads, manages, and routes to extensions.
+ * Supports source-based routing for responses (e.g., "chatbridge/room-42" -> the chatbridge extension)
+ */
+
+import type {
+  ExtensionMcpToolResult,
+  ExtensionMethodDefinition,
+  GatewayEvent,
+  WebStaticPath,
+} from "@anima/shared";
+import { animaLogFile, createLogger, getExtensionConfig } from "@anima/shared";
+import type { ExtensionHost, ExtensionRegistration, RemoteMcpToolInfo } from "./extension-host";
+import {
+  discoverConventionWebStatic,
+  mergeWebStatic,
+  StaticPathRegistry,
+} from "./web/static-paths";
+
+const log = createLogger("ExtensionManager", animaLogFile("gateway.log"));
+const HEALTH_CHECK_TIMEOUT_MS = 15_000;
+
+export class ExtensionManager {
+  // Source routing: maps source prefix -> extension ID
+  private sourceRoutes = new Map<string, string>();
+
+  // Extension hosts (NDJSON child processes or WebSocket-connected apps)
+  private remoteHosts = new Map<string, ExtensionHost>();
+  private remoteRegistrations = new Map<string, ExtensionRegistration>();
+  private remoteSourceRoutes = new Map<string, ExtensionHost>();
+  private remoteGenerations = new Map<string, string | null>();
+  private mcpToolOwners = new Map<string, string>();
+
+  // Web-only extensions — enabled in anima.json with a routes.ts(x) but no
+  // server-side index.ts. They contribute browser bundles + webStatic but
+  // have no methods, no events, and no host process.
+  private webOnlyRegistrations = new Map<string, { id: string; name: string }>();
+
+  /** Static URL paths contributed by extensions. Public so the HTTP layer can resolve. */
+  readonly staticPaths = new StaticPathRegistry();
+
+  /**
+   * Register a remote (out-of-process) extension.
+   * Called when an ExtensionHostProcess sends its registration message.
+   */
+  registerRemote(
+    registration: ExtensionRegistration,
+    host: ExtensionHost,
+    generationToken?: string,
+  ): void {
+    // Clean up old routes if re-registering (HMR reload)
+    if (this.remoteRegistrations.has(registration.id)) {
+      log.info("Re-registering extension (HMR)", { id: registration.id });
+      this.unregisterRemote(registration.id);
+    }
+
+    log.info("Registering remote extension", {
+      id: registration.id,
+      methods: registration.methods.map((m) => m.name),
+    });
+
+    this.remoteHosts.set(registration.id, host);
+    this.remoteRegistrations.set(registration.id, registration);
+    this.remoteGenerations.set(
+      registration.id,
+      generationToken ?? host.getGenerationToken() ?? null,
+    );
+
+    for (const tool of registration.mcpTools ?? []) {
+      const previousOwner = this.mcpToolOwners.get(tool.name);
+      if (previousOwner && previousOwner !== registration.id) {
+        log.warn("MCP tool name collision; latest registration wins", {
+          tool: tool.name,
+          previousOwner,
+          extensionId: registration.id,
+        });
+      }
+      this.mcpToolOwners.set(tool.name, registration.id);
+    }
+
+    // Register source routes for remote extension
+    for (const prefix of registration.sourceRoutes) {
+      this.remoteSourceRoutes.set(prefix, host);
+      this.sourceRoutes.set(prefix, registration.id);
+      log.info("Registered remote source route", { prefix, extensionId: registration.id });
+    }
+
+    // Register static URL paths — merge convention (filesystem) → code
+    // (extension's webStatic) → config (anima.json override). The convention
+    // entries were already seeded at startup, but we re-merge here so an
+    // extension's code declarations show up the first time it registers.
+    const convention = discoverConventionWebStatic(registration.id);
+    const codeStatic = (registration.webStatic ?? []) as WebStaticPath[];
+    const configStatic = (getExtensionConfig(registration.id)?.webStatic ?? []) as WebStaticPath[];
+    const mergedStatic = mergeWebStatic(mergeWebStatic(convention, codeStatic), configStatic);
+    this.staticPaths.set(registration.id, mergedStatic);
+  }
+
+  /**
+   * Register a web-only extension — one that is enabled in anima.json and
+   * has a `src/routes.ts(x)` (or convention `static/` folder) but no
+   * server-side `src/index.ts`. It contributes web routes and static paths
+   * only; no methods, events, or host process.
+   */
+  registerWebOnly(id: string, name: string): void {
+    if (this.webOnlyRegistrations.has(id)) {
+      log.info("Re-registering web-only extension", { id });
+      this.unregisterWebOnly(id);
+    }
+    log.info("Registering web-only extension", { id });
+    this.webOnlyRegistrations.set(id, { id, name });
+
+    // Same convention + config merge as registerRemote, minus the code-declared
+    // webStatic (a web-only extension has no server-side AnimaExtension to declare it).
+    const convention = discoverConventionWebStatic(id);
+    const configStatic = (getExtensionConfig(id)?.webStatic ?? []) as WebStaticPath[];
+    const merged = mergeWebStatic(convention, configStatic);
+    if (merged.length > 0) {
+      this.staticPaths.set(id, merged);
+    }
+  }
+
+  unregisterWebOnly(extensionId: string): void {
+    if (!this.webOnlyRegistrations.delete(extensionId)) return;
+    const convention = discoverConventionWebStatic(extensionId);
+    const configStatic = (getExtensionConfig(extensionId)?.webStatic ?? []) as WebStaticPath[];
+    const seed = mergeWebStatic(convention, configStatic);
+    if (seed.length > 0) {
+      this.staticPaths.set(extensionId, seed);
+    } else {
+      this.staticPaths.delete(extensionId);
+    }
+  }
+
+  /**
+   * Unregister a remote extension.
+   */
+  unregisterRemote(extensionId: string): void {
+    this.remoteHosts.delete(extensionId);
+    this.remoteGenerations.delete(extensionId);
+    // Drop the extension's code-declared paths but re-seed convention+config
+    // so any UI-only paths or anima.json entries remain active without it.
+    const convention = discoverConventionWebStatic(extensionId);
+    const configStatic = (getExtensionConfig(extensionId)?.webStatic ?? []) as WebStaticPath[];
+    const seed = mergeWebStatic(convention, configStatic);
+    if (seed.length > 0) {
+      this.staticPaths.set(extensionId, seed);
+    } else {
+      this.staticPaths.delete(extensionId);
+    }
+    const reg = this.remoteRegistrations.get(extensionId);
+    if (reg) {
+      this.remoteRegistrations.delete(extensionId);
+      for (const tool of reg.mcpTools ?? []) {
+        if (this.mcpToolOwners.get(tool.name) === extensionId) {
+          this.mcpToolOwners.delete(tool.name);
+          // Cold path: runs once per extension unregister. Building an inverted
+          // index for this would cost more than the linear scan saves.
+          // react-doctor-disable-next-line react-doctor/js-index-maps
+          const fallback = Array.from(this.remoteRegistrations.entries())
+            .reverse()
+            .find(([, candidate]) => candidate.mcpTools?.some((t) => t.name === tool.name));
+          if (fallback) {
+            this.mcpToolOwners.set(tool.name, fallback[0]);
+          }
+        }
+      }
+      for (const prefix of reg.sourceRoutes) {
+        // If another extension also declares this prefix, restore the most
+        // recently registered owner; otherwise remove the route. Same cold-
+        // path rationale as the mcpTool fallback above.
+        // react-doctor-disable-next-line react-doctor/js-index-maps
+        const fallback = Array.from(this.remoteRegistrations.entries())
+          .reverse()
+          // react-doctor-disable-next-line react-doctor/js-set-map-lookups
+          .find(([, candidate]) => candidate.sourceRoutes.includes(prefix));
+
+        if (!fallback) {
+          this.remoteSourceRoutes.delete(prefix);
+          this.sourceRoutes.delete(prefix);
+          continue;
+        }
+
+        const [fallbackExtensionId] = fallback;
+        const fallbackHost = this.remoteHosts.get(fallbackExtensionId);
+        if (!fallbackHost) {
+          this.remoteSourceRoutes.delete(prefix);
+          this.sourceRoutes.delete(prefix);
+          continue;
+        }
+
+        this.remoteSourceRoutes.set(prefix, fallbackHost);
+        this.sourceRoutes.set(prefix, fallbackExtensionId);
+      }
+    }
+  }
+
+  /**
+   * Get a remote extension host by ID.
+   */
+  getHost(extensionId: string): ExtensionHost | undefined {
+    return this.remoteHosts.get(extensionId);
+  }
+
+  getGeneration(extensionId: string): string | null {
+    return this.remoteGenerations.get(extensionId) ?? null;
+  }
+
+  isCurrentGeneration(extensionId: string, generationToken?: string): boolean {
+    const current = this.remoteGenerations.get(extensionId) ?? null;
+    if (!current || !generationToken) return true;
+    return current === generationToken;
+  }
+
+  /**
+   * Get all registered extension IDs.
+   */
+  getExtensionIds(): string[] {
+    return Array.from(this.remoteHosts.keys());
+  }
+
+  /**
+   * Route a method call to the appropriate out-of-process extension host.
+   * Supports RPC metadata for ctx.call() routing through the hub.
+   */
+  async handleMethod(
+    method: string,
+    params: Record<string, unknown>,
+    connectionId?: string,
+    meta?: { traceId?: string; depth?: number; deadlineMs?: number },
+    tags?: string[],
+  ): Promise<unknown> {
+    // Extract extension ID from method (e.g., "notify.send" -> "notify")
+    const [extensionId] = method.split(".");
+
+    const remoteHost = this.remoteHosts.get(extensionId);
+    if (!remoteHost) {
+      throw new Error(`No extension found for method: ${method}`);
+    }
+    const isHealthCheck = method.endsWith(".health_check");
+    const timeoutMs = isHealthCheck ? HEALTH_CHECK_TIMEOUT_MS : undefined;
+
+    if (isHealthCheck) {
+      // Health checks should never throw — return degraded status on timeout/error
+      try {
+        return await remoteHost.callMethod(method, params ?? {}, connectionId, {
+          ...meta,
+          timeoutMs,
+          tags,
+        });
+      } catch {
+        return {
+          ok: false,
+          status: "unresponsive",
+          label: `${extensionId} (unresponsive)`,
+          metrics: [{ label: "Status", value: "Extension not responding — may need restart" }],
+          items: [],
+        };
+      }
+    }
+
+    return remoteHost.callMethod(method, params ?? {}, connectionId, { ...meta, timeoutMs, tags });
+  }
+
+  /**
+   * Broadcast an event to all out-of-process extension hosts.
+   */
+  async broadcast(event: GatewayEvent, skipExtensionId?: string): Promise<void> {
+    // Debug: trace event broadcast to extensions
+    if (event.type.includes("content_block_start") || event.type.includes("message_stop")) {
+      const targets = Array.from(this.remoteHosts.keys()).filter((id) => id !== skipExtensionId);
+      log.info("BROADCAST_DEBUG", {
+        type: event.type,
+        skip: skipExtensionId,
+        targets,
+        conn: event.connectionId?.slice(0, 8),
+      });
+    }
+    // Forward to all remote extension hosts — skip the emitter extension if requested.
+    for (const [extId, host] of this.remoteHosts) {
+      if (extId !== skipExtensionId) {
+        host.sendEvent(event);
+      }
+    }
+  }
+
+  /**
+   * Route a response event back to the source that originated the request
+   * Source format: "prefix/id" (e.g., "chatbridge/room-42")
+   */
+  async routeToSource(source: string, event: GatewayEvent): Promise<boolean> {
+    // Extract prefix from source (e.g., "chatbridge/room-42" -> "chatbridge")
+    const prefix = source.split("/")[0];
+
+    // Check remote extension hosts first
+    const remoteHost = this.remoteSourceRoutes.get(prefix);
+    if (remoteHost) {
+      try {
+        await remoteHost.routeToSource(source, event);
+        return true;
+      } catch (error) {
+        log.error("Failed to route to remote source", { source, error: String(error) });
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Check if a source has a registered route
+   */
+  hasSourceRoute(source: string): boolean {
+    const prefix = source.split("/")[0];
+    return this.sourceRoutes.has(prefix);
+  }
+
+  /**
+   * Get the extension ID that handles a source
+   */
+  getSourceHandler(source: string): string | undefined {
+    const prefix = source.split("/")[0];
+    return this.sourceRoutes.get(prefix);
+  }
+
+  /**
+   * Check if a method is handled by any extension
+   */
+  hasMethod(method: string): boolean {
+    const [extensionId] = method.split(".");
+
+    // Check remote
+    const reg = this.remoteRegistrations.get(extensionId);
+    if (reg?.methods.some((m) => m.name === method)) return true;
+    return false;
+  }
+
+  getMcpTools(): Array<RemoteMcpToolInfo & { extensionId: string; extensionName: string }> {
+    const tools: Array<RemoteMcpToolInfo & { extensionId: string; extensionName: string }> = [];
+    for (const reg of this.remoteRegistrations.values()) {
+      for (const tool of reg.mcpTools ?? []) {
+        tools.push({
+          ...tool,
+          extensionId: reg.id,
+          extensionName: reg.name,
+        });
+      }
+    }
+    return tools;
+  }
+
+  async handleMcpTool(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<ExtensionMcpToolResult> {
+    const extensionId = this.mcpToolOwners.get(name);
+    if (!extensionId) {
+      throw new Error(`Unknown MCP tool: ${name}`);
+    }
+
+    const host = this.remoteHosts.get(extensionId);
+    if (!host) {
+      throw new Error(`MCP tool owner is not running: ${extensionId}`);
+    }
+
+    const result = await host.callMcpTool(name, args);
+    return normalizeMcpToolResult(result);
+  }
+
+  /**
+   * Get extension list for discovery (used by Mission Control)
+   */
+  getExtensionList(): Array<{ id: string; name: string; methods: string[] }> {
+    const remote = Array.from(this.remoteRegistrations.values()).map((reg) => ({
+      id: reg.id,
+      name: reg.name,
+      methods: reg.methods.map((m) => m.name),
+    }));
+    const webOnly = Array.from(this.webOnlyRegistrations.values()).map((reg) => ({
+      id: reg.id,
+      name: reg.name,
+      methods: [] as string[],
+    }));
+    return [...remote, ...webOnly];
+  }
+
+  getMethodDefinitions(): Array<{
+    extensionId: string;
+    extensionName: string;
+    method: ExtensionMethodDefinition;
+  }> {
+    const methods: Array<{
+      extensionId: string;
+      extensionName: string;
+      method: ExtensionMethodDefinition;
+    }> = [];
+
+    // Remote extensions don't have Zod schemas in the gateway,
+    // but we still include them for method discovery.
+    // The inputSchema will be a plain object (Zod _def), not a ZodType.
+    // Validation for remote methods happens in the host process.
+    for (const reg of this.remoteRegistrations.values()) {
+      for (const method of reg.methods) {
+        methods.push({
+          extensionId: reg.id,
+          extensionName: reg.name,
+          method: method as unknown as ExtensionMethodDefinition,
+        });
+      }
+    }
+
+    return methods;
+  }
+
+  /**
+   * Get extension health status
+   */
+  getHealth(): Record<string, { ok: boolean; details?: Record<string, unknown> }> {
+    const health: Record<string, { ok: boolean; details?: Record<string, unknown> }> = {};
+    // Remote extensions — report running status (async health check is separate)
+    for (const [id, host] of this.remoteHosts) {
+      health[id] = {
+        ok: host.isRunning(),
+        details: {
+          remote: true,
+          generation: this.remoteGenerations.get(id) ?? null,
+        },
+      };
+    }
+    return health;
+  }
+
+  /**
+   * Get all registered source routes
+   */
+  getSourceRoutes(): Record<string, string> {
+    const routes: Record<string, string> = {};
+    for (const [prefix, extensionId] of this.sourceRoutes) {
+      routes[prefix] = extensionId;
+    }
+    return routes;
+  }
+
+  /**
+   * Kill all remote extension host processes (for gateway shutdown).
+   */
+  async killRemoteHosts(): Promise<void> {
+    for (const [id, host] of this.remoteHosts) {
+      log.info("Killing remote extension host", { id });
+      await host.kill();
+    }
+    this.remoteHosts.clear();
+    this.remoteRegistrations.clear();
+    this.remoteGenerations.clear();
+    this.mcpToolOwners.clear();
+    this.remoteSourceRoutes.clear();
+    this.sourceRoutes.clear();
+  }
+
+  /**
+   * Synchronous force-kill for process "exit" handler (last resort).
+   */
+  forceKillRemoteHosts(): void {
+    for (const [, host] of this.remoteHosts) {
+      host.forceKill();
+    }
+    this.remoteHosts.clear();
+    this.remoteRegistrations.clear();
+    this.remoteGenerations.clear();
+    this.mcpToolOwners.clear();
+    this.remoteSourceRoutes.clear();
+    this.sourceRoutes.clear();
+  }
+}
+
+function normalizeMcpToolResult(result: unknown): ExtensionMcpToolResult {
+  if (
+    result &&
+    typeof result === "object" &&
+    Array.isArray((result as ExtensionMcpToolResult).content)
+  ) {
+    return result as ExtensionMcpToolResult;
+  }
+
+  if (typeof result === "string") {
+    return { content: [{ type: "text", text: result }] };
+  }
+
+  return {
+    content: [{ type: "text", text: JSON.stringify(result) }],
+  };
+}

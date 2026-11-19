@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# check-my-prs: status of YOUR open PRs (the `gh` user's), with local caching.
+# Lists open PRs with their review state in one GraphQL call, then fetches checks
+# (in parallel) only for PRs that are new, changed, or still had pending/failed
+# checks last time. Read-only: it never posts to or acts on a PR.
+# Needs gh (authenticated), jq and bash. Bundled with Anima's Today extension
+# (extensions/today/tools); usable on its own too.
+#
+# Cache stored in <git common dir>/pr-status-cache.json (shared by all worktrees,
+# and by the Today board, which runs `check-my-prs --json --all`). Only terminal runs
+# move the "updated since last check" marks, so the board never eats them.
+#
+# Approvals from people in CPRA_DESIGNERS (comma-separated logins, default empty)
+# don't make a PR approved on their own. This is opt-in, for teams that only count a
+# designer's approval for pure UI changes, which a script can't judge. (CPRA_ is short
+# for check-my-prs.)
+#
+# CPRA_FIXTURE_DIR replaces every gh call with files from that folder (raw.json plus
+# checks/<n>.json), for tests. CPRA_CACHE_FILE moves the cache.
+
+set -euo pipefail
+
+DESIGNERS="${CPRA_DESIGNERS:-}"
+FIXTURE_DIR="${CPRA_FIXTURE_DIR:-}"
+SHOW_CURRENT_ONLY=false
+SHOW_DRAFTS=false
+SHOW_ALL=false
+SHOW_APPROVED_ONLY=false
+SHOW_REREVIEW_ONLY=false
+LINK_FORMAT=false
+JSON_OUTPUT=false
+
+usage() {
+  echo "Usage: $(basename "$0") [current|--current|-c] [--draft|-d] [--all] [--approved|-a] [--rereview|-r] [--links|-s] [--json] [-R owner/repo]"
+  echo "  -c  only the PR (or stack) for the current branch"
+  echo "  -d  draft PRs instead of ready ones"
+  echo "  --all  drafts and ready PRs together"
+  echo "  -a  only approved PRs (not by designers alone): what can merge right now"
+  echo "  -r  only PRs with a reviewer asked to re-review"
+  echo "  -s  print Markdown link lines to paste instead (grouped by reviewer with -r)"
+  echo "  --json  print the PRs as JSON, with holdReason (used by the Today board)"
+  echo "  -R  the repo to check (default: the current directory's)"
+  exit 1
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    current|--current|-c) SHOW_CURRENT_ONLY=true ;;
+    --draft|-d) SHOW_DRAFTS=true ;;
+    --all) SHOW_ALL=true ;;
+    --approved|-a) SHOW_APPROVED_ONLY=true ;;
+    --rereview|-r) SHOW_REREVIEW_ONLY=true ;;
+    --links|-s) LINK_FORMAT=true ;;
+    --json) JSON_OUTPUT=true ;;
+    -R|--repo) [ $# -ge 2 ] || usage; export GH_REPO="$2"; shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+# The cache lives in the git common dir when there is one. Outside a git checkout (a
+# project folder that isn't a repo, run with -R), it goes to a per-repo file in the
+# user's cache folder instead, so the run still works.
+if [ -n "${CPRA_CACHE_FILE:-}" ]; then
+  CACHE_FILE="$CPRA_CACHE_FILE"
+elif git_dir=$(git rev-parse --git-common-dir 2>/dev/null); then
+  CACHE_FILE="$git_dir/pr-status-cache.json"
+else
+  if [ -z "${GH_REPO:-}" ] && [ -z "$FIXTURE_DIR" ]; then
+    echo "$(basename "$0"): $(pwd) is not a git repository; pass -R owner/repo" >&2
+    exit 2
+  fi
+  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/check-my-prs"
+  mkdir -p "$cache_dir"
+  CACHE_FILE="$cache_dir/$(printf '%s' "${GH_REPO:-default}" | tr '/' '_').json"
+fi
+
+# ── Stack names (from gh-stack, network-free) ──
+# Stacks themselves come from baseRefName chains below, because gh-stack state is
+# per worktree and only knows stacks made in this one. gh-stack just supplies the
+# name and description when it knows the stack.
+stacks_json='{"stacks":[]}'
+if [ -z "$FIXTURE_DIR" ] && command -v gh-stack &> /dev/null; then
+  stacks_json=$(gh-stack stacks --json 2>/dev/null || echo "$stacks_json")
+fi
+
+# ── Step 1: List open PRs with review state, without check data ──
+# statusCheckRollup carries every historical check run (160+ per PR in a busy repo), so
+# requesting it for all PRs in one query exceeds GitHub's GraphQL timeout (504).
+# `gh pr list` can't be used here: its latestReviews has no commit oids, and a
+# re-requested reviewer drops out of latestReviews entirely, so the review history
+# comes from `reviews`. Avoid mergeStateStatus: it adds ~1.3s; `mergeable` is cheap.
+read -r -d '' LIST_QUERY <<'EOF' || true
+query($q: String!, $n: Int!) {
+  search(query: $q, type: ISSUE, first: $n) {
+    nodes {
+      ... on PullRequest {
+        number title url isDraft createdAt updatedAt
+        headRefName headRefOid baseRefName mergeable reviewDecision
+        author { login }
+        baseRepository { defaultBranchRef { name } }
+        autoMergeRequest { enabledAt }
+        reviewRequests(first: 20) {
+          nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } ... on Team { slug } } }
+        }
+        latestOpinionatedReviews(first: 20) { nodes { state author { __typename login } } }
+        reviews(last: 100) { nodes { state author { __typename login } commit { oid } } }
+        reviewThreads(first: 100) {
+          nodes {
+            isResolved
+            first: comments(first: 1) { nodes { author { __typename login } } }
+            last: comments(last: 1) { nodes { author { __typename login } } }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+if [ -n "$FIXTURE_DIR" ]; then
+  cp "$FIXTURE_DIR/raw.json" "$tmpdir/raw.json"
+else
+  # GitHub prices a query by the page sizes it asks for, not what comes back: at first: 50
+  # this costs 102 of the 5,000 GraphQL points an hour even with a dozen PRs open (Anima's
+  # /today polls it). Count first (1 point), then ask for exactly that many.
+  count=$(gh api graphql -F q='repo:{owner}/{repo} is:pr is:open author:@me' \
+    -f query='query($q: String!) { search(query: $q, type: ISSUE, first: 1) { issueCount } }' \
+    --jq .data.search.issueCount)
+  n=$(( count < 1 ? 1 : (count > 50 ? 50 : count) ))
+  gh api graphql -F q='repo:{owner}/{repo} is:pr is:open author:@me' -F n="$n" \
+    -f query="$LIST_QUERY" > "$tmpdir/raw.json"
+
+  # GitHub works out `mergeable` lazily: right after main moves, the first query answers UNKNOWN
+  # and starts the check. Read as "no conflicts", a conflicting PR flips to "awaiting review" for
+  # one run (the Today board saw it happen). Ask again for just those PRs, a few seconds apart.
+  for _ in 1 2 3; do
+    unknown=$(jq -r '[.data.search.nodes[] | select(.mergeable == "UNKNOWN") | .number] | join(" ")' "$tmpdir/raw.json")
+    [ -z "$unknown" ] && break
+    sleep 3
+    fields=""
+    for num in $unknown; do fields+=" pr$num: pullRequest(number: $num) { mergeable }"; done
+    gh api graphql -F owner='{owner}' -F name='{repo}' \
+      -f query="query(\$owner: String!, \$name: String!) { repository(owner: \$owner, name: \$name) { $fields } }" \
+      > "$tmpdir/mergeable.json" || break
+    jq --slurpfile m "$tmpdir/mergeable.json" '
+      ($m[0].data.repository // {}) as $fresh
+      | .data.search.nodes |= map(
+          if .mergeable == "UNKNOWN" and ($fresh["pr\(.number)"].mergeable // null) != null
+          then .mergeable = $fresh["pr\(.number)"].mergeable else . end)
+    ' "$tmpdir/raw.json" > "$tmpdir/raw.next.json" && mv "$tmpdir/raw.next.json" "$tmpdir/raw.json"
+  done
+fi
+
+# Reduce each PR to what the display needs. Bots and the PR author's own replies
+# don't count as reviews.
+jq --arg designers "$DESIGNERS" '
+  ($designers | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))) as $designer_list
+  | .data.search.nodes
+  | map(select(.number != null))
+  | map(
+      . as $pr
+      | .author.login as $me
+      | [.reviewRequests.nodes[].requestedReviewer
+          | if .__typename == "Team" then "@" + .slug else .login end] as $requested
+      | [.reviews.nodes[]
+          | select(.author != null and .author.__typename != "Bot" and .author.login != $me and .state != "PENDING")] as $human
+      | [.latestOpinionatedReviews.nodes[]
+          | select(.author != null and .author.__typename != "Bot" and .author.login != $me)] as $opinions
+      | ([$human[].author.login] | unique) as $reviewers
+      | [$opinions[] | select(.state == "APPROVED") | .author.login] as $approvers
+      # Reviewers who commented and are not asked again, split by whether their last
+      # review is on head (nothing pushed since: your move) or on an older commit
+      # (you pushed since: time to re-request them).
+      | [$reviewers[] as $r
+         | select((any($requested[]; . == $r) or any($approvers[]; . == $r)) | not)
+         | {login: $r, onHead: (([$human[] | select(.author.login == $r)] | last | .commit.oid) == $pr.headRefOid)}
+        ] as $unrequested
+      # Every approver is a designer: not approved for merging (see the header).
+      | (($approvers | length) > 0 and all($approvers[]; . as $a | any($designer_list[]; . == $a))) as $designer_only
+      # Unresolved review threads, by whose move it is. A bot thread (an AI reviewer,
+      # e.g. CodeRabbit) is ours until it is resolved, whoever spoke last: fix it, or
+      # reply and resolve. A thread a person opened is ours when they spoke last, and theirs when we
+      # did (we answered; it waits on their reply). Our own self-review notes with no reply
+      # are neither.
+      | [(.reviewThreads.nodes // [])[] | select(.isResolved | not)
+          | {opener: .first.nodes[0].author, last: .last.nodes[0].author}
+          | . + {bot: ((.opener.__typename // "") == "Bot")}] as $threads
+      | [$threads[] | select(.bot)] as $bot_threads
+      | [$threads[] | select((.bot | not) and (.last.login // "") != $me)] as $their_word
+      | [$threads[] | select((.bot | not) and (.opener.login // "") != $me and (.last.login // "") == $me)] as $our_word
+      | {
+          number, title, url, isDraft, createdAt, updatedAt, headRefName, baseRefName,
+          defaultBranch: (.baseRepository.defaultBranchRef.name // "main"),
+          conflicts: (.mergeable == "CONFLICTING"),
+          reviewDecision: (.reviewDecision // ""),
+          approved: (.reviewDecision == "APPROVED" and ($designer_only | not)),
+          designerOnly: $designer_only,
+          autoMerge: (.autoMergeRequest != null),
+          # Unresolved threads that need us: every bot thread, and a thread a person opened where
+          # they spoke last. botThreads is the bot share of openThreads.
+          openThreads: (($bot_threads | length) + ($their_word | length)),
+          botThreads: ($bot_threads | length),
+          botThreadAuthors: ([$bot_threads[].opener.login] | unique),
+          # A thread a person opened that we answered last: it waits on their reply, not on us.
+          waitingThreads: ($our_word | length),
+          waitingThreadsOn: ([$our_word[].opener.login] | unique),
+          requested: $requested,
+          approvedBy: $approvers,
+          changesBy: [$opinions[] | select(.state == "CHANGES_REQUESTED") | .author.login],
+          # Requested again after reviewing an older commit: their last review is not on head.
+          reReview: [
+            $requested[] as $r
+            | ([$human[] | select(.author.login == $r)] | last)
+            | select(. != null and .commit.oid != $pr.headRefOid)
+            | {login: .author.login,
+               state: (.state | ascii_downcase | gsub("_"; " ")),
+               from: .commit.oid[0:7], to: $pr.headRefOid[0:7]}
+          ],
+          reviewers: $reviewers,
+          yourTurn: [$unrequested[] | select(.onHead) | .login],
+          notReRequested: [$unrequested[] | select(.onHead | not) | .login]
+        }
+    )
+  # Stacks: parent is the open PR whose head is this base. parentApproved holds for
+  # the whole chain down to the default branch; waitingOn names the nearest PR in
+  # it that is not approved. A base that is neither the default branch nor an open
+  # PR leaves all three null.
+  | (map({key: .headRefName, value: .}) | from_entries) as $by_head
+  | def blocker($pr; $depth):
+      if $pr.baseRefName == $pr.defaultBranch or $depth > 20 then null
+      else $by_head[$pr.baseRefName] as $p
+        | if $p == null then (if $depth > 0 then $pr.number else null end)
+          elif ($p.approved | not) then $p.number
+          else blocker($p; $depth + 1) end
+      end;
+    map(
+      $by_head[.baseRefName] as $p
+      | if .baseRefName == .defaultBranch then . + {parent: null, parentApproved: true, waitingOn: null}
+        elif $p == null then . + {parent: null, parentApproved: null, waitingOn: null}
+        else blocker(.; 0) as $b | . + {parent: $p.number, parentApproved: ($b == null), waitingOn: $b}
+        end
+    )
+' "$tmpdir/raw.json" > "$tmpdir/all.json"
+
+if [ "$(jq 'length' "$tmpdir/all.json")" -eq 0 ]; then
+  if [ "$JSON_OUTPUT" = true ]; then echo '[]'; else echo "No open PRs found. 🎉"; fi
+  echo '{}' > "$CACHE_FILE"
+  exit 0
+fi
+
+jq --argjson drafts "$SHOW_DRAFTS" --argjson everything "$SHOW_ALL" --argjson approved "$SHOW_APPROVED_ONLY" --argjson rereview "$SHOW_REREVIEW_ONLY" '
+  [.[]
+   | select($everything or .isDraft == $drafts)
+   | select(($approved | not) or .approved)
+   | select(($rereview | not) or (.reReview | length) > 0)]
+' "$tmpdir/all.json" > "$tmpdir/fresh.json"
+
+if [ "$(jq 'length' "$tmpdir/fresh.json")" -eq 0 ]; then
+  if [ "$JSON_OUTPUT" = true ]; then
+    echo '[]'
+  elif [ "$SHOW_REREVIEW_ONLY" = true ]; then
+    echo "No PRs waiting on a re-review."
+  elif [ "$SHOW_APPROVED_ONLY" = true ]; then
+    echo "No approved PRs yet."
+  elif [ "$SHOW_DRAFTS" = true ]; then
+    echo "No draft PRs."
+  else
+    echo "No open PRs found. 🎉"
+  fi
+  exit 0
+fi
+
+# ── Step 2: Compare against cache to find what changed ──
+cached='{}'
+if [ -f "$CACHE_FILE" ] && jq -e 'type == "object"' "$CACHE_FILE" > /dev/null 2>&1; then
+  cached=$(cat "$CACHE_FILE")
+fi
+# Pass large JSON to jq via files: an old cache holding raw rollups can exceed ARG_MAX.
+echo "$cached" > "$tmpdir/cached.json"
+
+# CI finishing or being re-run doesn't bump a PR's updatedAt, so only a cached
+# all-green result can be trusted for an unchanged PR.
+to_fetch=$(jq -rn --slurpfile fresh "$tmpdir/fresh.json" --slurpfile cached "$tmpdir/cached.json" '
+  $fresh[0][]
+  | $cached[0][(.number | tostring)] as $old
+  | select($old == null
+      or $old.updatedAt != .updatedAt
+      or $old.totalChecks == null
+      or ($old.checksUnavailable // false)
+      or $old.pendingChecks > 0
+      or $old.failedChecks > 0)
+  | .number
+')
+
+if [ -n "$to_fetch" ] && [ -n "$FIXTURE_DIR" ]; then
+  for n in $to_fetch; do
+    if [ -f "$FIXTURE_DIR/checks/$n.json" ]; then cp "$FIXTURE_DIR/checks/$n.json" "$tmpdir/$n.json"; fi
+  done
+elif [ -n "$to_fetch" ]; then
+  echo "$to_fetch" | xargs -P 8 -I{} sh -c \
+    'gh pr view "$1" --json statusCheckRollup > "$2/$1.json" 2>/dev/null || rm -f "$2/$1.json"' \
+    _ {} "$tmpdir"
+fi
+
+# statusCheckRollup returns ALL historical runs per check (a new push cancels the
+# in-flight run and starts a fresh one — both show up). Dedupe by name, keeping
+# the latest by startedAt/completedAt, so counts match what GitHub's UI shows.
+#
+# A cancelled duplicate run keeps its job's `name:` expression unevaluated, e.g.
+#   (github.event.action == 'unlabeled' && …) && 'ci-result (skipped)' || 'ci-result'
+# so it would never fold into the real `ci-result`. Such names map to their last
+# quoted literal (the expression's fallback). Cancelled runs are neutral, not
+# failures: GitHub's merge box treats a superseded one as noise too.
+fetched_checks='{}'
+if compgen -G "$tmpdir/[0-9]*.json" > /dev/null; then
+  fetched_checks=$(jq -n '
+    def check_name:
+      if test("'"'"'[^'"'"']*'"'"'") and test("^\\(|&&|\\|\\|")
+      then [scan("'"'"'([^'"'"']*)'"'"'")] | last | .[0]
+      else . end;
+    def passed: .conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED";
+    def failed: .conclusion == "FAILURE" or .conclusion == "TIMED_OUT"
+      or .conclusion == "ACTION_REQUIRED" or .conclusion == "STARTUP_FAILURE";
+    def cancelled: .conclusion == "CANCELLED" or .conclusion == "STALE";
+    def pending: .status != null and .status != "COMPLETED";
+    reduce inputs as $view ({};
+      ($view.statusCheckRollup // []
+        | map(select(.name != null) | .name |= check_name)
+        | group_by(.name)
+        | map(sort_by(.startedAt // .completedAt // "") | last)
+      ) as $latest
+      | (input_filename | split("/") | last | rtrimstr(".json")) as $key
+      | . + { ($key): {
+        totalChecks: ($latest | length),
+        passedChecks: ([$latest[] | select(passed)] | length),
+        failedChecks: ([$latest[] | select(failed)] | length),
+        cancelledChecks: ([$latest[] | select(cancelled)] | length),
+        pendingChecks: ([$latest[] | select(pending)] | length),
+        failedNames: [$latest[] | select(failed) | .name][0:3],
+        cancelledNames: [$latest[] | select(cancelled) | .name][0:3]
+      }}
+    )
+  ' "$tmpdir"/[0-9]*.json)
+fi
+echo "$fetched_checks" > "$tmpdir/checks.json"
+
+# A failed fetch keeps the last known counts, flagged so the next run retries it.
+# Entries for open PRs outside this view (drafts, unapproved) are kept, so a
+# filtered run doesn't throw away the cache for the others.
+#
+# seenUpdatedAt is the updatedAt the terminal last showed: only a terminal run
+# (not --json) moves it, so the board's runs don't clear the ● marks.
+jq -n \
+  --slurpfile all "$tmpdir/all.json" \
+  --slurpfile fresh "$tmpdir/fresh.json" \
+  --slurpfile cached "$tmpdir/cached.json" \
+  --slurpfile checks "$tmpdir/checks.json" \
+  --argjson seen "$( [ "$JSON_OUTPUT" = true ] && echo false || echo true )" \
+  --arg attempted "$to_fetch" '
+  def ci_fields: {
+    totalChecks, passedChecks, failedChecks, pendingChecks, failedNames,
+    cancelledChecks: (.cancelledChecks // 0), cancelledNames: (.cancelledNames // [])
+  };
+  ($attempted | split("\n") | map(select(. != ""))) as $attempted
+  | ($all[0] | map(.number | tostring)) as $open
+  | ($cached[0] | with_entries(select(.key as $k | any($open[]; . == $k)))) as $kept
+  | reduce $fresh[0][] as $pr ($kept;
+    ($pr.number | tostring) as $key
+    | $cached[0][$key] as $old
+    | (if $checks[0][$key] != null then $checks[0][$key]
+       elif ($attempted | index($key)) == null and $old.totalChecks != null then
+         $old | ci_fields
+       elif $old.totalChecks != null then
+         ($old | ci_fields) + {checksUnavailable: true}
+       else
+         {totalChecks: 0, passedChecks: 0, failedChecks: 0, cancelledChecks: 0, pendingChecks: 0,
+          failedNames: [], cancelledNames: [], checksUnavailable: true}
+       end) as $ci
+    | (if $seen then $pr.updatedAt else ($old.seenUpdatedAt // $old.updatedAt) end) as $seen_at
+    | . + { ($key): ($pr + $ci + {seenUpdatedAt: $seen_at}) }
+  )
+' > "$tmpdir/new_cache.json"
+
+# The board and a terminal can run at once: write beside the cache, then rename.
+cp "$tmpdir/new_cache.json" "$CACHE_FILE.$$"
+mv "$CACHE_FILE.$$" "$CACHE_FILE"
+
+# ── Step 3: Display ──────────────────────────────────────
+current_branch=""
+if [ "$SHOW_CURRENT_ONLY" = true ]; then
+  current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  [ "$current_branch" = "HEAD" ] && current_branch=""
+fi
+
+jq -rn \
+  --slurpfile all "$tmpdir/all.json" \
+  --slurpfile fresh "$tmpdir/fresh.json" \
+  --slurpfile cache "$tmpdir/new_cache.json" \
+  --slurpfile old "$tmpdir/cached.json" \
+  --argjson stacks "$stacks_json" \
+  --argjson current_only "$SHOW_CURRENT_ONLY" \
+  --argjson drafts "$SHOW_DRAFTS" \
+  --argjson approved "$SHOW_APPROVED_ONLY" \
+  --argjson rereview "$SHOW_REREVIEW_ONLY" \
+  --argjson links "$LINK_FORMAT" \
+  --argjson json "$JSON_OUTPUT" \
+  --arg current_branch "$current_branch" \
+  --arg cache_file "$CACHE_FILE" '
+  def c($code): "\u001b[\($code)m";
+  def nc: c("0");
+  def gray: c("0;90");
+  def red: c("0;31");
+  def yellow: c("1;33");
+  def cyan: c("0;36");
+  def bold: c("1");
+
+  def names($l): if ($l | length) > 3 then ($l[0:3] | join(", ")) + " +\(($l | length) - 3)" else $l | join(", ") end;
+  def by($l): if ($l | length) > 0 then ": " + names($l) else "" end;
+  def rr_text: "\(.login) (\(.state) \(.from) → \(.to))";
+
+  # Commenters not asked again: their comments are on head (answer them), or you pushed
+  # since (re-request them when ready).
+  def follow_up:
+    [ (if (.yourTurn // [] | length) > 0 then "💬 Your turn: " + names(.yourTurn) else empty end),
+      (if (.notReRequested // [] | length) > 0 then "📤 Re-request? " + names(.notReRequested) else empty end)
+    ] | join(" · ");
+
+  # Why the PR is (or isnt) waiting on review.
+  def review_seg:
+    if .isDraft then "📝 Draft"
+    elif .reviewDecision == "CHANGES_REQUESTED" then
+      [.reReview[] | select(.state == "changes requested")] as $rr
+      | if ($rr | length) > 0 then "🔁 Re-review: " + ($rr | map(rr_text) | join(", "))
+        else "❌ Changes requested" + by(.changesBy) end
+    elif .reviewDecision == "APPROVED" and (.designerOnly // false) then
+      "🎨 Designer approval only" + by(.approvedBy) + " · needs an engineer"
+      + (if (.reReview | length) > 0 then " · 🔁 re-review: " + names(.reReview | map(.login)) else "" end)
+    elif .reviewDecision == "APPROVED" then
+      "✅ Approved" + by(.approvedBy)
+      + (if (.reReview | length) > 0 then " · 🔁 re-review: " + names(.reReview | map(.login)) else "" end)
+    elif (.reReview | length) > 0 then
+      "🔁 Re-review: " + (.reReview[0:2] | map(rr_text) | join(", "))
+      + (if (.reReview | length) > 2 then " +\((.reReview | length) - 2)" else "" end)
+    elif (.requested | length) == 0 then
+      (if follow_up != "" then follow_up else "⏳ No reviewers" end)
+    elif (.reviewers | length) == 0 then "👀 Never reviewed · asked " + names(.requested)
+    else "👀 Needs review · asked " + names(.requested) + (if follow_up != "" then " · " + follow_up else "" end)
+    end;
+
+  # Ready to ping only when nothing is still in motion on the PR.
+  def hold_reason:
+    if .conflicts then "conflicts"
+    elif (.failedChecks // 0) > 0 then "\(.failedChecks) failed"
+    elif (.pendingChecks // 0) > 0 then "CI running"
+    elif (.checksUnavailable // false) then "checks unavailable"
+    else null end;
+
+  def ci_seg:
+    (.totalChecks // 0) as $t | (.passedChecks // 0) as $p | (.failedChecks // 0) as $f
+    | (.pendingChecks // 0) as $q | (.cancelledChecks // 0) as $x | (.checksUnavailable // false) as $u
+    | (if $u and $t == 0 then "⚠️ Checks unavailable"
+       elif $t == 0 then "⚪ No checks"
+       elif $f > 0 then "❌ \($f) failed"
+       elif $q > 0 then "🟡 \($q) running"
+       elif $p + $x == $t then "✅ All passing (\($p))" + (if $x > 0 then " · \($x) cancelled" else "" end)
+       else "⚪ Unknown" end)
+    + (if $u and $t > 0 then " (stale)" else "" end);
+
+  def extra_segs($heads):
+    [ (if .conflicts then "💥 Conflicts" else empty end),
+      ((.openThreads // 0) as $n
+       | if $n > 0 then "💬 \($n) open thread\(if $n == 1 then "" else "s" end)" else empty end),
+      ((.waitingThreads // 0) as $n
+       | if $n > 0 then "⏳ \($n) awaiting a reply from \((.waitingThreadsOn // []) | join(", "))" else empty end),
+      (if (.approved // false) and .baseRefName != .defaultBranch then
+         (if .waitingOn then "⛓️ Waiting on #\(.waitingOn)"
+          elif .parentApproved == true then "⛓️ On #\(.parent) (approved)"
+          else "⛓️ Base: \(.baseRefName)" end)
+       else empty end),
+      (if .autoMerge then "🤖 Auto-merge armed" else empty end) ];
+
+  def pr_block($lead; $indent; $note; $changed; $heads):
+    ("\($lead)\(if .isDraft then "📝" else "🔵" end) #\(.number): \(.title[0:70])\($note)"
+      + (if $changed then " \(yellow)●\(nc)" else "" end)),
+    ("\($indent)   " + ([review_seg, ci_seg] + extra_segs($heads) | join("  │  "))),
+    ("\($indent)   \(gray)\(.url)\(nc)"),
+    ((.failedNames // [])[] | "\($indent)   \(red)↳ \(.[0:70])\(nc)"),
+    ((.cancelledNames // [])[] | "\($indent)   \(gray)⊘ \(.[0:70]) (cancelled)\(nc)");
+
+  # Stacks come from baseRefName chains among the shown PRs.
+  def kids($shown; $p): [$shown[] | select(.baseRefName == $p.headRefName)] | sort_by(.number);
+  def descend($shown; $p; $parent): {pr: $p, parent: $parent}, (kids($shown; $p)[] | descend($shown; .; $p.number));
+  def stack_info($tree):
+    ($tree | map(.pr.headRefName)) as $branches
+    | (first($stacks.stacks[]? | select(any(.branches[]; .branch as $b | any($branches[]; . == $b))))
+       // {name: $tree[0].pr.headRefName, description: null});
+
+  # Markdown PR link [title](url), safe to paste into chat. Brackets would end the link
+  # text early; <>, *, ~, backtick and | trigger chat formatting or mention syntax,
+  # and so do underscores at a word edge (__proto__). Inner ones (user_id) are safe.
+  # (No apostrophes in this program: it sits in a single-quoted bash string.)
+  def link_line: "[\(.title | gsub("[\\[\\]<>*~`|]"; "") | gsub("(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" "))](\(.url))";
+
+  ($all[0] | map({key: .headRefName, value: .number}) | from_entries) as $heads
+  | $cache[0] as $c
+  | $old[0] as $o
+  | [$fresh[0][] | $c[(.number | tostring)]] as $candidates
+  # With -r, a PR still being worked on (failing, running, conflicting) is held back
+  # so it does not get pinged; it is listed on its own line instead.
+  | (if $rereview then [$candidates[] | select(hold_reason == null)] else $candidates end) as $shown
+  | (if $rereview then [$candidates[] | select(hold_reason != null)] else [] end) as $held
+  | ($held | map("#\(.number) (\(hold_reason))") | join(", ")) as $held_text
+  | [$shown[] | $o[(.number | tostring)] as $prev
+     | select(.updatedAt != ($prev.seenUpdatedAt // $prev.updatedAt)) | .number] as $changed
+  | [$shown[] | select(.baseRefName as $b | any($shown[]; .headRefName == $b) | not)] as $roots
+  | [$roots[] | [descend($shown; .; null)]] as $trees
+  | (if $current_only then
+       [$trees[] | select(any(.[]; .pr.headRefName == $current_branch))]
+     else $trees end) as $trees
+  | ([$trees[] | select(length > 1)] | sort_by(map(.pr.updatedAt) | max) | reverse) as $stacked
+  | ([$trees[] | select(length == 1) | .[0].pr] | sort_by(.updatedAt) | reverse) as $standalone
+  | ([$stacked[][].pr] + $standalone) as $ordered
+  | if $json then
+      $candidates | map(. + {holdReason: hold_reason}) | tojson
+    elif $links then
+      # Plain lines to paste; with -r, one block per reviewer to ping. Held PRs go
+      # to stderr, so the note shows in the terminal but stays out of a pipe to pbcopy.
+      (if $held_text != "" then ("⏸ Not ready to ping: " + $held_text + "\n") | stderr | empty else empty end),
+      if $rereview then
+        ([$ordered[].reReview[].login] | unique) as $logins
+        | range(0; $logins | length) as $i
+        | $logins[$i] as $login
+        | (if $i > 0 then "" else empty end),
+          "\(gray)\($login)\(nc)",
+          ($ordered[] | select(any(.reReview[]; .login == $login)) | link_line)
+      else
+        $ordered[] | link_line
+      end
+    else
+  (if $current_only then (if ($stacked | length) > 0 then "📊 Current Stack" else "📊 Current PR" end)
+     elif $rereview then "📊 My PRs Waiting on Re-review"
+     elif $approved then "📊 My Approved PRs"
+     elif $drafts then "📊 My Draft PRs"
+     else "📊 My Open PRs" end) as $title
+  | ($shown | length) as $count
+  | "\(bold)\($title)\(nc)  \(gray)(\($count) open, \($changed | length) updated, \($count - ($changed | length)) cached)\(nc)",
+    "",
+    (if $current_only and ($trees | length) == 0 then
+       if $current_branch != "" then "\(yellow)No open PR found for current branch:\(nc) \($current_branch)"
+       else "\(yellow)Could not determine the current branch.\(nc)" end
+     else
+       ($stacked[] as $tree
+        | stack_info($tree) as $info
+        | "\(cyan)📚 Stack: \(yellow)\($info.name)\(nc)",
+          (if ($info.description // "") != "" then "   \(gray)\($info.description)\(nc)" else empty end),
+          "",
+          (range(0; $tree | length) as $i
+           | $tree[$i] as $item
+           | (if $i > 0 then "   ┃" else empty end),
+             ($item.pr | pr_block(
+               "   \(if $i == ($tree | length) - 1 then "┗━" else "┣━" end) \($i + 1). ";
+               "      ";
+               (if $i > 0 and $item.parent != $tree[$i - 1].pr.number then " \(gray)↰ #\($item.parent)\(nc)" else "" end);
+               (.number as $n | any($changed[]; . == $n));
+               $heads))),
+          ""),
+       (if ($standalone | length) > 0 then "\(cyan)📋 Standalone PRs\(nc)", "" else empty end),
+       ($standalone[] | pr_block(""; ""; ""; (.number as $n | any($changed[]; . == $n)); $heads), "")
+     end),
+    (if $held_text != "" then "\(gray)⏸ Not ready to ping: \($held_text)\(nc)", "" else empty end),
+    "\(gray)────────────────────────────────────────\(nc)",
+    "\(gray)\(yellow)●\(gray) = updated since last check  │  Cache: \($cache_file)\(nc)"
+    end
+'

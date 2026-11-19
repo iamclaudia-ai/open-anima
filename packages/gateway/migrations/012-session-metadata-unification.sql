@@ -1,0 +1,33 @@
+-- Up
+PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS sessions;
+
+CREATE TABLE sessions (
+  id                  TEXT PRIMARY KEY,
+  workspace_id        TEXT NOT NULL REFERENCES workspaces(id),
+  provider_session_id TEXT NOT NULL,
+  agent               TEXT NOT NULL DEFAULT 'claude',
+  purpose             TEXT NOT NULL DEFAULT 'chat',
+  parent_session_id   TEXT REFERENCES sessions(id),
+  status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+  runtime_status      TEXT NOT NULL DEFAULT 'idle' CHECK(runtime_status IN ('idle','running','completed','failed','interrupted','stalled')),
+  title               TEXT,
+  summary             TEXT,
+  metadata_json       TEXT,
+  previous_session_id TEXT REFERENCES sessions(id),
+  last_activity       TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_sessions_workspace ON sessions(workspace_id);
+CREATE INDEX idx_sessions_provider_session ON sessions(provider_session_id);
+CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
+CREATE INDEX idx_sessions_workspace_purpose ON sessions(workspace_id, purpose);
+CREATE INDEX idx_sessions_last_activity ON sessions(last_activity DESC);
+
+PRAGMA foreign_keys = ON;
+
+-- Down
+DROP TABLE IF EXISTS sessions;

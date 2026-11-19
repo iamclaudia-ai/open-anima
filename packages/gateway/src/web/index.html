@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Anima</title>
+
+    <!-- Theme Color -->
+    <meta name="theme-color" content="#8b5cf6" />
+
+    <!-- iOS PWA Support (meta tags only — no link/href that Bun would resolve) -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Anima" />
+
+    <!-- Compiled SPA stylesheet (Tailwind + @anima/ui/styles).
+         Built by spa-bundler.ts and served from /spa.css. -->
+    <link rel="stylesheet" href="/spa.css" />
+
+    <!-- Fonts: Newsreader (memory pages) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Importmap: shared deps that every bundle (SPA + extensions) externalizes
+         so the same module instances are used everywhere. Must come BEFORE the
+         first module script. Keep entries in sync with VENDOR_SPECS in
+         packages/gateway/src/web/vendor-bundler.ts. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "/vendor/react.js",
+          "react/jsx-runtime": "/vendor/react-jsx-runtime.js",
+          "react/jsx-dev-runtime": "/vendor/react-jsx-dev-runtime.js",
+          "react-dom": "/vendor/react-dom.js",
+          "react-dom/client": "/vendor/react-dom-client.js",
+          "@anima/ui": "/vendor/anima-ui.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!--
+      Error Beacon — runs BEFORE React loads.
+      Catches all JS errors (including module load failures) and reports
+      them to the gateway. Heartbeat confirms the app rendered successfully.
+      This script is intentionally inline and vanilla JS — no dependencies.
+    -->
+    <script>
+      (function () {
+        var BEACON_URL = location.protocol + "//" + location.host;
+        var POLL_INTERVAL = 10000; // Check DOM state every 10s
+
+        // ── DOM Health Check ────────────────────────────────────
+        // Every poll, inspect the actual DOM and report what we see.
+        // This is the single source of truth — no event handlers needed
+        // for error detection. The DOM doesn't lie.
+
+        function checkAndReport() {
+          var status = getDOMStatus();
+          try {
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", BEACON_URL + "/api/client-health", true);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            xhr.send(JSON.stringify(status));
+          } catch (e) {}
+        }
+
+        function getDOMStatus() {
+          var root = document.getElementById("root");
+          var hasContent = root && root.children.length > 0;
+
+          // Check for Bun's HMR error overlay
+          var bunHmr = document.querySelector("bun-hmr");
+          var hmrError = null;
+          if (bunHmr) {
+            try {
+              var shadow = bunHmr.shadowRoot;
+              if (shadow) {
+                // Extract error text from the overlay
+                var errorDesc = shadow.querySelector(".message-desc");
+                var errorName = shadow.querySelector(".r-error code.name");
+                if (errorDesc) {
+                  hmrError =
+                    (errorName ? errorName.textContent + ": " : "") + errorDesc.textContent;
+                } else {
+                  // Fallback: grab any visible text from error content
+                  var errorContent = shadow.querySelector(".error-content");
+                  if (errorContent) hmrError = errorContent.textContent.slice(0, 500);
+                }
+              }
+            } catch (e) {
+              hmrError = "bun-hmr overlay present (shadow DOM inaccessible)";
+            }
+          }
+
+          return {
+            url: location.href,
+            timestamp: new Date().toISOString(),
+            rendered: !!hasContent && !bunHmr,
+            hasContent: !!hasContent,
+            bunHmrError: hmrError,
+          };
+        }
+
+        // Heartbeat management
+        var heartbeatInterval = null;
+        var initialTimeout = null;
+
+        function startHeartbeat() {
+          if (heartbeatInterval) return; // Already running
+          heartbeatInterval = setInterval(checkAndReport, POLL_INTERVAL);
+        }
+
+        function stopHeartbeat() {
+          if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+          }
+          if (initialTimeout) {
+            clearTimeout(initialTimeout);
+            initialTimeout = null;
+          }
+        }
+
+        function restartHeartbeat() {
+          stopHeartbeat();
+          checkAndReport(); // Immediate check
+          startHeartbeat();
+        }
+
+        // Start polling after 3s (give React time to mount), then every 10s
+        initialTimeout = setTimeout(function () {
+          checkAndReport();
+          startHeartbeat();
+        }, 3000);
+
+        // Also catch JS errors and report immediately (best-effort, may not fire if HMR intercepts)
+        window.addEventListener("error", function (event) {
+          try {
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", BEACON_URL + "/api/client-error", true);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            xhr.send(
+              JSON.stringify({
+                type: "runtime",
+                message: (event.message || "Unknown error").slice(0, 500),
+                stack: (event.error && event.error.stack
+                  ? event.error.stack
+                  : "at " + event.filename + ":" + event.lineno + ":" + event.colno
+                ).slice(0, 2000),
+                url: location.href,
+                timestamp: new Date().toISOString(),
+                userAgent: navigator.userAgent,
+              }),
+            );
+          } catch (e) {}
+        });
+
+        window.addEventListener("unhandledrejection", function (event) {
+          var reason = event.reason;
+          try {
+            var xhr = new XMLHttpRequest();
+            xhr.open("POST", BEACON_URL + "/api/client-error", true);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            xhr.send(
+              JSON.stringify({
+                type: "unhandled_rejection",
+                message: (reason instanceof Error
+                  ? reason.message
+                  : String(reason || "Unknown")
+                ).slice(0, 500),
+                stack: (reason instanceof Error ? reason.stack || "" : "").slice(0, 2000),
+                url: location.href,
+                timestamp: new Date().toISOString(),
+                userAgent: navigator.userAgent,
+              }),
+            );
+          } catch (e) {}
+        });
+
+        // Expose for React ErrorBoundary to report caught render errors
+        window.__animaBeacon = {
+          stopHeartbeat: stopHeartbeat,
+          restartHeartbeat: restartHeartbeat,
+          reportError: function (type, message, stack) {
+            try {
+              var xhr = new XMLHttpRequest();
+              xhr.open("POST", BEACON_URL + "/api/client-error", true);
+              xhr.setRequestHeader("Content-Type", "application/json");
+              xhr.send(
+                JSON.stringify({
+                  type: type,
+                  message: (message || "Unknown").slice(0, 500),
+                  stack: (stack || "").slice(0, 2000),
+                  url: location.href,
+                  timestamp: new Date().toISOString(),
+                  userAgent: navigator.userAgent,
+                }),
+              );
+            } catch (e) {}
+          },
+        };
+      })();
+    </script>
+
+    <!-- Built by spa-bundler.ts and served from /spa.js. The bundle
+         leaves shared deps as bare imports; the importmap above resolves
+         them to /vendor/*.js so SPA + extensions share module instances. -->
+    <script type="module" src="/spa.js"></script>
+  </body>
+</html>

@@ -1,0 +1,642 @@
+/**
+ * Session Host — manages SDKSession instances inside the agent-host server.
+ *
+ * This owns provider SDK sessions for logical sessions managed by the session
+ * extension. Key details:
+ * - Lives in the agent-host process (separate from gateway/extensions)
+ * - Broadcasts events to WebSocket clients instead of ctx.emit()
+ * - Uses EventBuffer for reconnection replay
+ * - Persists session registry to disk for crash recovery
+ *
+ * Provider SDK sessions live in agent-host so extension processes do not own
+ * long-running LLM runtime state.
+ */
+
+import { EventEmitter } from "node:events";
+import { createAnthropicProvider } from "./providers/anthropic/sdk-session";
+import { EventBuffer, type BufferedEvent } from "./event-buffer";
+import type { SessionEventMessage } from "./protocol";
+import type { HookReply, PermissionRequestInput } from "./providers/cli/permission-requests";
+import { animaLogFile, createLogger, heldByBackgroundWork } from "@anima/shared";
+import type { ThinkingEffort } from "@anima/shared";
+import {
+  LEGACY_PROFILE,
+  resolveProfile,
+  type ResolvedProfile,
+  type SessionProfile,
+} from "./profiles";
+import type {
+  AgentRuntimeFactory,
+  AgentRuntimeProviders,
+  AgentRuntimeSession,
+  AgentRuntimeSessionInfo,
+  CreateSessionOptions,
+  ResumeSessionOptions,
+  RuntimeDrain,
+  StreamEvent,
+} from "./provider-types";
+
+/** A released session whose responses are still finishing. */
+export interface SessionDrain extends RuntimeDrain {
+  sessionId: string;
+}
+
+export type {
+  AgentRuntimeFactory,
+  AgentRuntimeProviders,
+  AgentRuntimeSession,
+  AgentRuntimeSessionInfo,
+} from "./provider-types";
+
+const log = createLogger("SessionHost", animaLogFile("agent-host.log"));
+
+// ── Types ────────────────────────────────────────────────────
+
+export interface SessionCreateParams {
+  /** Optional caller-supplied session UUID */
+  sessionId?: string;
+  /** Working directory */
+  cwd: string;
+  /** Agent/provider key (default: claude) */
+  agent?: string;
+  /** Model to use */
+  model?: string;
+  /** System prompt */
+  systemPrompt?: string;
+  /** Enable adaptive thinking */
+  thinking?: boolean;
+  /** Thinking effort level */
+  effort?: ThinkingEffort;
+  /** Runtime sandbox mode, when supported */
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  /** Permission profile name (required: there is no implicit default). */
+  profile: string;
+}
+
+export interface SessionResumeParams {
+  /** Claude Code session UUID to resume */
+  sessionId: string;
+  /** Working directory */
+  cwd: string;
+  /** Agent/provider key (default: claude) */
+  agent?: string;
+  /** Model to use */
+  model?: string;
+  /** Last observed activity timestamp (ISO) for restore hydration */
+  lastActivity?: string;
+  /** Enable adaptive thinking */
+  thinking?: boolean;
+  /** Thinking effort level */
+  effort?: ThinkingEffort;
+  /**
+   * Permission profile name. Omitted only by restore/adopt, which can't know
+   * it; the next prompt carries the real one and rebuilds a mismatch.
+   */
+  profile?: string;
+}
+
+/** Session defaults from config */
+export interface SessionDefaults {
+  model?: string;
+  thinking?: boolean;
+  effort?: ThinkingEffort;
+}
+
+/** Serializable session metadata for persistence */
+export interface SessionRecord {
+  id: string;
+  agent?: string;
+  cwd: string;
+  model: string;
+  createdAt: string;
+  lastActivity: string;
+  /** Permission profile the session runs under. */
+  profile?: string;
+}
+
+const DEFAULT_AGENT = "claude";
+
+function createDefaultProviders(): AgentRuntimeProviders {
+  return {
+    [DEFAULT_AGENT]: createAnthropicProvider(),
+  };
+}
+
+// ── SessionHost ──────────────────────────────────────────────
+
+/**
+ * Manages all SDK sessions and their event buffers.
+ *
+ * Emits "session.event" with SessionEventMessage payloads for WebSocket broadcast.
+ * Each session gets its own EventBuffer for reconnection replay.
+ */
+export class SessionHost extends EventEmitter {
+  private sessions = new Map<string, AgentRuntimeSession>();
+  private sessionAgents = new Map<string, string>();
+  private sessionProfiles = new Map<string, string>();
+  private profiles: Record<string, SessionProfile>;
+  private eventBuffers = new Map<string, EventBuffer>();
+  /** Sessions the idle reaper is keeping for their background work (logged once per hold). */
+  private readonly heldForBackground = new Set<string>();
+  private defaults: SessionDefaults = {};
+  private providers: AgentRuntimeProviders;
+
+  constructor(options?: {
+    providers?: AgentRuntimeProviders;
+    /** `agentHost.sessionProfiles` from anima.json, merged over the built-ins. */
+    profiles?: Record<string, SessionProfile>;
+  }) {
+    super();
+    this.providers = options?.providers || createDefaultProviders();
+    this.profiles = options?.profiles ?? {};
+  }
+
+  /** Resolve a profile name against config + built-ins. Throws when unknown. */
+  resolveProfile(name: string): ResolvedProfile {
+    return resolveProfile(name, this.profiles);
+  }
+
+  /** The profile a tracked session runs under, if any. */
+  getSessionProfile(sessionId: string): string | undefined {
+    return this.sessionProfiles.get(sessionId);
+  }
+
+  /**
+   * Set session defaults for lazy-resume fallback.
+   */
+  setDefaults(defaults: SessionDefaults): void {
+    this.defaults = defaults;
+  }
+
+  /**
+   * Create a new Claude session.
+   */
+  async create(params: SessionCreateParams): Promise<{ sessionId: string }> {
+    const agent = params.agent || DEFAULT_AGENT;
+    const provider = this.resolveProvider(agent);
+
+    const resolvedModel = params.model ?? this.defaults.model;
+    if (!resolvedModel) {
+      throw new Error("Session model is required. Configure extensions.session.config.model.");
+    }
+    if (!params.profile) throw new Error("A session profile is required to create a session");
+    const profile = this.resolveProfile(params.profile);
+    const options: CreateSessionOptions = {
+      sessionId: params.sessionId,
+      cwd: params.cwd,
+      model: resolvedModel,
+      systemPrompt: params.systemPrompt,
+      thinking: params.thinking ?? this.defaults.thinking,
+      effort: params.effort ?? this.defaults.effort,
+      sandbox: params.sandbox,
+      profile,
+    };
+
+    const session = provider.create(options);
+    await session.start();
+
+    this.sessions.set(session.id, session);
+    this.sessionAgents.set(session.id, agent);
+    this.sessionProfiles.set(session.id, profile.name);
+    this.eventBuffers.set(session.id, new EventBuffer());
+    this.wireSession(session);
+
+    log.info("Created session", {
+      agent,
+      sessionId: session.id.slice(0, 8),
+      profile: profile.name,
+    });
+    return { sessionId: session.id };
+  }
+
+  /**
+   * Resume an existing Claude session.
+   */
+  async resume(params: SessionResumeParams): Promise<{ sessionId: string }> {
+    const agent = params.agent || DEFAULT_AGENT;
+    const provider = this.resolveProvider(agent);
+
+    // Check if already active
+    const existing = this.sessions.get(params.sessionId);
+    if (existing?.isActive) {
+      log.info("Session already active", { sessionId: params.sessionId.slice(0, 8) });
+      return { sessionId: existing.id };
+    }
+
+    const resolvedModel = params.model ?? this.defaults.model;
+    if (!resolvedModel) {
+      throw new Error("Session model is required. Configure extensions.session.config.model.");
+    }
+    const profile = this.resolveProfile(params.profile ?? LEGACY_PROFILE);
+    const options: ResumeSessionOptions = {
+      cwd: params.cwd,
+      model: resolvedModel,
+      lastActivity: params.lastActivity,
+      thinking: params.thinking ?? this.defaults.thinking,
+      effort: params.effort ?? this.defaults.effort,
+      profile,
+    };
+
+    const session = provider.resume(params.sessionId, options);
+    await session.start();
+
+    this.sessions.set(session.id, session);
+    this.sessionAgents.set(session.id, agent);
+    this.sessionProfiles.set(session.id, profile.name);
+    if (!this.eventBuffers.has(session.id)) {
+      this.eventBuffers.set(session.id, new EventBuffer());
+    }
+    this.wireSession(session);
+
+    log.info("Resumed session", {
+      agent,
+      sessionId: session.id.slice(0, 8),
+      profile: profile.name,
+    });
+    return { sessionId: session.id };
+  }
+
+  /**
+   * Send a prompt to a session.
+   * If the session isn't running, auto-resumes it first (lazy start).
+   */
+  async prompt(
+    sessionId: string,
+    content: string | unknown[],
+    cwd?: string,
+    model?: string,
+    agent?: string,
+    profileName?: string,
+  ): Promise<void> {
+    const resolvedAgent = agent || this.sessionAgents.get(sessionId) || DEFAULT_AGENT;
+    this.resolveProvider(resolvedAgent);
+    if (!profileName) throw new Error(`A session profile is required to prompt ${sessionId}`);
+    const profile = this.resolveProfile(profileName);
+
+    let session = this.sessions.get(sessionId);
+
+    // The caller's profile is authoritative (it lives on the session's row).
+    // A session restored or adopted without one, or under a different one, is
+    // closed, not just released: a CLI pane keeps the flags it was launched
+    // with, so only a fresh launch is guaranteed to carry the right powers.
+    const runningProfile = this.sessionProfiles.get(sessionId);
+    if (session && runningProfile !== profile.name) {
+      log.warn("Session profile mismatch; rebuilding before prompt", {
+        sessionId: sessionId.slice(0, 8),
+        running: runningProfile ?? "unknown",
+        expected: profile.name,
+      });
+      await this.close(sessionId);
+      session = undefined;
+    }
+
+    if (!session || !session.isActive) {
+      // Lazy resume — session died or agent-host restarted
+      if (!cwd) {
+        throw new Error(`Session not found and no cwd provided for auto-resume: ${sessionId}`);
+      }
+      log.info("Auto-resuming session", {
+        sessionId: sessionId.slice(0, 8),
+        agent: resolvedAgent,
+        cwd,
+        model: model || this.defaults.model,
+      });
+      const resumeModel = model ?? this.defaults.model;
+      if (!resumeModel) {
+        throw new Error("Session model is required. Configure extensions.session.config.model.");
+      }
+      await this.resume({
+        sessionId,
+        cwd,
+        agent: resolvedAgent,
+        model: resumeModel,
+        thinking: this.defaults.thinking,
+        effort: this.defaults.effort,
+        profile: profile.name,
+      });
+      session = this.sessions.get(sessionId)!;
+    }
+
+    await session.prompt(content);
+  }
+
+  /**
+   * Interrupt a session's current response.
+   */
+  interrupt(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.interrupt();
+    return true;
+  }
+
+  /**
+   * Answer a modal prompt the session is blocked on.
+   */
+  async answerModal(
+    sessionId: string,
+    key: string,
+    fingerprint?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return { ok: false, error: "Session not found" };
+    if (!session.answerModal) {
+      return { ok: false, error: "This session's runtime has no modal prompts" };
+    }
+    return session.answerModal(key, fingerprint);
+  }
+
+  /**
+   * Route a `PermissionRequest` hook call to its session. No decision
+   * when the session isn't here or can't take it: the dialog stays the answer.
+   */
+  async requestPermission(
+    sessionId: string,
+    input: PermissionRequestInput,
+    signal?: AbortSignal,
+  ): Promise<HookReply> {
+    const session = this.sessions.get(sessionId);
+    if (!session?.requestPermission) return { decision: null };
+    return session.requestPermission(input, signal);
+  }
+
+  /**
+   * Set the permission mode for a session.
+   */
+  setPermissionMode(sessionId: string, mode: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.setPermissionMode(mode);
+    return true;
+  }
+
+  /**
+   * Send a tool_result for an interactive tool.
+   */
+  sendToolResult(sessionId: string, toolUseId: string, content: string, isError = false): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.sendToolResult(toolUseId, content, isError);
+    return true;
+  }
+
+  /**
+   * Close a session — kill process.
+   */
+  async close(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    await session.close();
+    this.sessions.delete(sessionId);
+    this.sessionAgents.delete(sessionId);
+    this.sessionProfiles.delete(sessionId);
+    // Keep event buffer around briefly for clients that haven't seen close yet
+    log.info("Closed session", { sessionId: sessionId.slice(0, 8) });
+  }
+
+  /**
+   * List all active sessions. `getInfo()` reads CLI liveness from the shared
+   * snapshot, so this spawns nothing, but `/health` still only needs
+   * `count()`.
+   */
+  list(): AgentRuntimeSessionInfo[] {
+    return Array.from(this.sessions.values()).map((s) => s.getInfo());
+  }
+
+  /** Cheap session count — no per-session subprocess work. */
+  count(): number {
+    return this.sessions.size;
+  }
+
+  /** Cheap set of currently-tracked session IDs — no per-session subprocess work. */
+  trackedIds(): Set<string> {
+    return new Set(this.sessions.keys());
+  }
+
+  /**
+   * Get buffered events after a given sequence number (for reconnection replay).
+   */
+  getEventsAfter(sessionId: string, lastSeq: number): BufferedEvent[] {
+    const buffer = this.eventBuffers.get(sessionId);
+    if (!buffer) return [];
+    return buffer.getAfter(lastSeq);
+  }
+
+  /**
+   * Get active session IDs (for persistence).
+   */
+  getSessionRecords(): SessionRecord[] {
+    return Array.from(this.sessions.values())
+      .map((s) => s.getInfo())
+      .filter((info) => info.isProcessRunning)
+      .map((info) => ({
+        id: info.id,
+        agent: this.sessionAgents.get(info.id) || DEFAULT_AGENT,
+        cwd: info.cwd,
+        model: info.model,
+        createdAt: info.createdAt,
+        lastActivity: info.lastActivity,
+        profile: this.sessionProfiles.get(info.id),
+      }));
+  }
+
+  /**
+   * Stop tracking a session, preferring `release()` over `close()` when the
+   * provider implements it.
+   *
+   * `release()` drops our in-process state (proxy, JSONL tail, modal watcher)
+   * but leaves out-of-process runtime alive — for the CLI provider that means
+   * the tmux pane and the `claude` process keep running, so anything living
+   * *inside* that process survives: a `Monitor` watching a long job, a tool
+   * mid-flight. `close()` would kill the pane and take all of it down.
+   *
+   * SDK/Codex providers implement no `release()` and fall through to `close()`,
+   * since their runtime lives in-process and dies with us anyway.
+   *
+   * This is deliberately NOT what `close(sessionId)` does. An explicit close
+   * from a client means "tear it down"; this means "stop holding it".
+   *
+   * Only `closeAll()` may use this — agent-host is going away, so something
+   * must come back for the pane, and startup restore does. The idle reaper must
+   * NOT: nothing comes back for a pane we release while still running, and it
+   * then survives forever.
+   */
+  private async detach(sessionId: string): Promise<SessionDrain | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return null;
+    let drain: SessionDrain | null = null;
+    try {
+      if (session.release) {
+        const released = await session.release();
+        if (released && released.inFlight > 0) drain = { sessionId, ...released };
+      } else await session.close();
+    } catch (error) {
+      log.warn("detach: error releasing session", {
+        sessionId: sessionId.slice(0, 8),
+        error: String(error),
+      });
+    }
+    this.sessions.delete(sessionId);
+    this.sessionAgents.delete(sessionId);
+    this.sessionProfiles.delete(sessionId);
+    return drain;
+  }
+
+  /**
+   * Release every session — for graceful shutdown. CLI panes survive the
+   * restart and are reused on next startup (no respawn, no startup probes).
+   * Returns the sessions whose responses are still streaming.
+   */
+  async closeAll(): Promise<SessionDrain[]> {
+    // Snapshot the ids first: `detach` mutates `this.sessions`.
+    const drains = await Promise.all(Array.from(this.sessions.keys()).map((id) => this.detach(id)));
+    return drains.filter((d): d is SessionDrain => d !== null);
+  }
+
+  /**
+   * Close sessions whose runtime is live but which have been idle beyond the
+   * threshold. Session metadata remains persisted, so the next prompt
+   * lazy-resumes.
+   *
+   * Must be `close()`, not `detach()`. Releasing looks kinder — it preserves
+   * the tmux pane and the `claude` process, so a `Monitor` running inside
+   * survives — but it removes the ONLY path that ever terminates a CLI session:
+   * a released session is untracked, and `reapOrphanTmuxPanes()` skips every
+   * untracked pane whose process is still alive (the liveness snapshot is its
+   * ground truth). Nothing else kills one. Shipping that traded a recoverable
+   * inconvenience for an unbounded leak: dozens of panes and many GB resident
+   * within days.
+   *
+   * A session waiting on background work (a `Monitor`, a background shell or
+   * subagent, a cron) isn't idle, however quiet its turns, so it is skipped
+   * until that work ends or a day passes with no turn at all (see
+   * `heldByBackgroundWork`).
+   */
+  async reapIdleRunningSessions(idleMs: number, nowMs: number = Date.now()): Promise<string[]> {
+    if (!Number.isFinite(idleMs) || idleMs <= 0) {
+      return [];
+    }
+
+    const staleSessions: Array<{ sessionId: string; idleForMs: number }> = [];
+    for (const [sessionId, session] of this.sessions) {
+      const info = session.getInfo();
+      if (!info.isActive || !info.isProcessRunning) {
+        continue;
+      }
+
+      const lastActivityMs = Date.parse(info.lastActivity);
+      if (!Number.isFinite(lastActivityMs)) {
+        continue;
+      }
+
+      const idleForMs = nowMs - lastActivityMs;
+      if (idleForMs < idleMs) {
+        // Active again: a later hold is a new one, worth its own log line.
+        this.heldForBackground.delete(sessionId);
+        continue;
+      }
+      // Quiet turns, but a Monitor or a cron still running: not idle.
+      if (heldByBackgroundWork(info.backgroundTasks, idleForMs)) {
+        if (!this.heldForBackground.has(sessionId)) {
+          this.heldForBackground.add(sessionId);
+          log.info("Idle reaper keeping session with background work", {
+            sessionId: sessionId.slice(0, 8),
+            idleForMs,
+            backgroundTasks: info.backgroundTasks,
+          });
+        }
+        continue;
+      }
+      this.heldForBackground.delete(sessionId);
+      staleSessions.push({ sessionId, idleForMs });
+    }
+
+    for (const { sessionId, idleForMs } of staleSessions) {
+      log.info("Idle reaper closing session", {
+        sessionId: sessionId.slice(0, 8),
+        idleForMs,
+        idleThresholdMs: idleMs,
+      });
+      await this.close(sessionId);
+    }
+
+    return staleSessions.map((s) => s.sessionId);
+  }
+
+  // ── Private ────────────────────────────────────────────────
+
+  private resolveProvider(agent: string): AgentRuntimeFactory {
+    const provider = this.providers[agent];
+    if (!provider) {
+      throw new Error(`Unsupported session agent: ${agent}`);
+    }
+    return provider;
+  }
+
+  /**
+   * Wire a session's events to the event buffer and emit for WebSocket broadcast.
+   *
+   * Each SSE event from the SDK gets:
+   * 1. Buffered with a monotonic sequence number
+   * 2. Emitted as "session.event" for the WebSocket server to broadcast
+   */
+  private wireSession(session: AgentRuntimeSession): void {
+    const sessionId = session.id;
+
+    session.on("sse", (event: StreamEvent) => {
+      const buffer = this.eventBuffers.get(sessionId);
+      if (!buffer) return;
+
+      const seq = buffer.push(event);
+
+      const msg: SessionEventMessage = {
+        type: "session.event",
+        sessionId,
+        event: event as { type: string; [key: string]: unknown },
+        seq,
+      };
+
+      this.emit("session.event", msg);
+    });
+
+    session.on("process_started", () => {
+      const buffer = this.eventBuffers.get(sessionId);
+      if (!buffer) return;
+
+      const event = { type: "process_started" };
+      const seq = buffer.push(event);
+
+      this.emit("session.event", {
+        type: "session.event",
+        sessionId,
+        event,
+        seq,
+      } satisfies SessionEventMessage);
+    });
+
+    session.on("process_ended", () => {
+      const buffer = this.eventBuffers.get(sessionId);
+      if (!buffer) return;
+
+      const event = { type: "process_ended" };
+      const seq = buffer.push(event);
+
+      this.emit("session.event", {
+        type: "session.event",
+        sessionId,
+        event,
+        seq,
+      } satisfies SessionEventMessage);
+    });
+
+    session.on("closed", () => {
+      this.sessions.delete(sessionId);
+      this.sessionAgents.delete(sessionId);
+      this.sessionProfiles.delete(sessionId);
+      this.eventBuffers.delete(sessionId);
+      this.heldForBackground.delete(sessionId);
+      log.info("Cleaned up session buffers", { sessionId: sessionId.slice(0, 8) });
+    });
+  }
+}

@@ -1,0 +1,479 @@
+/**
+ * Scheduler Extension — Database Access Layer
+ *
+ * SQLite storage for scheduled tasks and execution history.
+ * Opens its own bun:sqlite connection to ~/.anima/anima.db.
+ * WAL mode + busy_timeout for safe concurrent access.
+ */
+
+import { Database } from "bun:sqlite";
+import { join } from "node:path";
+import { animaDataDir } from "@anima/shared";
+
+const dbPath = join(animaDataDir(), "anima.db");
+
+let db: Database | null = null;
+
+function getDb(): Database {
+  if (db) return db;
+
+  db = new Database(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("PRAGMA busy_timeout = 5000");
+
+  return db;
+}
+
+export function closeDb(): void {
+  if (db) {
+    db.close();
+    db = null;
+  }
+}
+
+// ── Types ───────────────────────────────────────────────────
+
+interface TaskRow {
+  id: string;
+  name: string;
+  description: string | null;
+  type: "once" | "interval" | "cron";
+  fire_at: string;
+  interval_seconds: number | null;
+  cron_expr: string | null;
+  action_type: "emit" | "extension_call" | "notification" | "exec";
+  action_target: string;
+  action_payload: string | null;
+  missed_policy: "fire_once" | "skip" | "fire_all";
+  concurrency: "allow" | "skip_if_running" | "cancel_previous";
+  start_deadline_seconds: number | null;
+  enabled: number;
+  tags: string | null;
+  created_at: string;
+  fired_count: number;
+  last_fired_at: string | null;
+  keep_history: number;
+  output_dir: string | null;
+  retries: number;
+  retry_delay_seconds: number;
+  alert_after_failures: number;
+}
+
+export interface ExecutionRow {
+  id: string;
+  task_id: string;
+  fired_at: string;
+  completed_at: string | null;
+  status: "running" | "success" | "error" | "skipped" | "cancelled";
+  duration_ms: number | null;
+  error: string | null;
+  output: string | null;
+  progress_message: string | null;
+  created_at: string;
+}
+
+/** The shape used by the rest of the extension (not raw SQL rows). */
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  description?: string;
+  type: "once" | "interval" | "cron";
+  fireAt: string;
+  intervalSeconds?: number;
+  cronExpr?: string;
+  action: {
+    type: "emit" | "extension_call" | "notification" | "exec";
+    target: string;
+    payload?: Record<string, unknown>;
+  };
+  missedPolicy: "fire_once" | "skip" | "fire_all";
+  concurrency: "allow" | "skip_if_running" | "cancel_previous";
+  startDeadlineSeconds?: number;
+  enabled: boolean;
+  tags?: string[];
+  createdAt: string;
+  firedCount: number;
+  lastFiredAt?: string;
+  keepHistory: number;
+  /** Output directory pattern with template variables. Resolved and auto-created via {{task.output_dir}}. */
+  outputDir?: string;
+  /** Extra attempts after a failed run, before it counts as failed (and notifies). */
+  retries: number;
+  /** Wait before the first retry; doubles for each one after it. */
+  retryDelaySeconds: number;
+  /** Consecutive failed runs before the user is notified (1 = the first failure). */
+  alertAfterFailures: number;
+}
+
+// ── Row ↔ Task conversion ───────────────────────────────────
+
+function rowToTask(row: TaskRow): ScheduledTask {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description ?? undefined,
+    type: row.type,
+    fireAt: row.fire_at,
+    intervalSeconds: row.interval_seconds ?? undefined,
+    cronExpr: row.cron_expr ?? undefined,
+    action: {
+      type: row.action_type,
+      target: row.action_target,
+      payload: row.action_payload ? JSON.parse(row.action_payload) : undefined,
+    },
+    missedPolicy: row.missed_policy,
+    concurrency: row.concurrency,
+    startDeadlineSeconds: row.start_deadline_seconds ?? undefined,
+    enabled: row.enabled === 1,
+    tags: row.tags ? JSON.parse(row.tags) : undefined,
+    createdAt: row.created_at,
+    firedCount: row.fired_count,
+    lastFiredAt: row.last_fired_at ?? undefined,
+    keepHistory: row.keep_history,
+    outputDir: row.output_dir ?? undefined,
+    retries: row.retries,
+    retryDelaySeconds: row.retry_delay_seconds,
+    alertAfterFailures: row.alert_after_failures,
+  };
+}
+
+// ── CRUD ────────────────────────────────────────────────────
+
+export function insertTask(task: ScheduledTask): void {
+  getDb()
+    .query(
+      `INSERT INTO scheduler_tasks
+       (id, name, description, type, fire_at, interval_seconds, cron_expr,
+        action_type, action_target, action_payload,
+        missed_policy, concurrency, start_deadline_seconds,
+        enabled, tags, created_at, fired_count, last_fired_at, keep_history, output_dir,
+        retries, retry_delay_seconds, alert_after_failures)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      task.id,
+      task.name,
+      task.description ?? null,
+      task.type,
+      task.fireAt,
+      task.intervalSeconds ?? null,
+      task.cronExpr ?? null,
+      task.action.type,
+      task.action.target,
+      task.action.payload ? JSON.stringify(task.action.payload) : null,
+      task.missedPolicy,
+      task.concurrency,
+      task.startDeadlineSeconds ?? null,
+      task.enabled ? 1 : 0,
+      task.tags ? JSON.stringify(task.tags) : null,
+      task.createdAt,
+      task.firedCount,
+      task.lastFiredAt ?? null,
+      task.keepHistory,
+      task.outputDir ?? null,
+      task.retries,
+      task.retryDelaySeconds,
+      task.alertAfterFailures,
+    );
+}
+
+export function getAllTasks(): ScheduledTask[] {
+  const rows = getDb().query(`SELECT * FROM scheduler_tasks`).all() as TaskRow[];
+  return rows.map(rowToTask);
+}
+
+export function getEnabledDueTasks(nowIso: string): ScheduledTask[] {
+  const rows = getDb()
+    .query(`SELECT * FROM scheduler_tasks WHERE enabled = 1 AND fire_at <= ?`)
+    .all(nowIso) as TaskRow[];
+  return rows.map(rowToTask);
+}
+
+export function getTaskById(id: string): ScheduledTask | null {
+  const row = getDb().query(`SELECT * FROM scheduler_tasks WHERE id = ?`).get(id) as TaskRow | null;
+  return row ? rowToTask(row) : null;
+}
+
+export function updateTaskAfterFire(
+  id: string,
+  newFireAt: string,
+  firedCount: number,
+  lastFiredAt: string,
+): void {
+  getDb()
+    .query(
+      `UPDATE scheduler_tasks
+       SET fire_at = ?, fired_count = ?, last_fired_at = ?
+       WHERE id = ?`,
+    )
+    .run(newFireAt, firedCount, lastFiredAt, id);
+}
+
+export function deleteTask(id: string): number {
+  const result = getDb().query(`DELETE FROM scheduler_tasks WHERE id = ?`).run(id);
+  return result.changes;
+}
+
+export function setTaskEnabled(id: string, enabled: boolean): void {
+  getDb()
+    .query(`UPDATE scheduler_tasks SET enabled = ? WHERE id = ?`)
+    .run(enabled ? 1 : 0, id);
+}
+
+export function updateTask(
+  id: string,
+  updates: Partial<
+    Pick<
+      ScheduledTask,
+      | "name"
+      | "description"
+      | "fireAt"
+      | "intervalSeconds"
+      | "cronExpr"
+      | "action"
+      | "missedPolicy"
+      | "concurrency"
+      | "startDeadlineSeconds"
+      | "tags"
+      | "keepHistory"
+      | "outputDir"
+      | "retries"
+      | "retryDelaySeconds"
+      | "alertAfterFailures"
+    >
+  >,
+): void {
+  const setClauses: string[] = [];
+  const values: (string | number | null)[] = [];
+
+  if (updates.name !== undefined) {
+    setClauses.push("name = ?");
+    values.push(updates.name);
+  }
+  if (updates.description !== undefined) {
+    setClauses.push("description = ?");
+    values.push(updates.description);
+  }
+  if (updates.fireAt !== undefined) {
+    setClauses.push("fire_at = ?");
+    values.push(updates.fireAt);
+  }
+  if (updates.intervalSeconds !== undefined) {
+    setClauses.push("interval_seconds = ?");
+    values.push(updates.intervalSeconds);
+  }
+  if (updates.cronExpr !== undefined) {
+    setClauses.push("cron_expr = ?");
+    values.push(updates.cronExpr);
+  }
+  if (updates.action !== undefined) {
+    setClauses.push("action_type = ?");
+    values.push(updates.action.type);
+    setClauses.push("action_target = ?");
+    values.push(updates.action.target);
+    setClauses.push("action_payload = ?");
+    values.push(updates.action.payload ? JSON.stringify(updates.action.payload) : null);
+  }
+  if (updates.missedPolicy !== undefined) {
+    setClauses.push("missed_policy = ?");
+    values.push(updates.missedPolicy);
+  }
+  if (updates.concurrency !== undefined) {
+    setClauses.push("concurrency = ?");
+    values.push(updates.concurrency);
+  }
+  if (updates.startDeadlineSeconds !== undefined) {
+    setClauses.push("start_deadline_seconds = ?");
+    values.push(updates.startDeadlineSeconds);
+  }
+  if (updates.tags !== undefined) {
+    setClauses.push("tags = ?");
+    values.push(JSON.stringify(updates.tags));
+  }
+  if (updates.keepHistory !== undefined) {
+    setClauses.push("keep_history = ?");
+    values.push(updates.keepHistory);
+  }
+  if (updates.outputDir !== undefined) {
+    setClauses.push("output_dir = ?");
+    values.push(updates.outputDir);
+  }
+  if (updates.retries !== undefined) {
+    setClauses.push("retries = ?");
+    values.push(updates.retries);
+  }
+  if (updates.retryDelaySeconds !== undefined) {
+    setClauses.push("retry_delay_seconds = ?");
+    values.push(updates.retryDelaySeconds);
+  }
+  if (updates.alertAfterFailures !== undefined) {
+    setClauses.push("alert_after_failures = ?");
+    values.push(updates.alertAfterFailures);
+  }
+
+  if (setClauses.length === 0) return;
+
+  values.push(id);
+  getDb()
+    .query(`UPDATE scheduler_tasks SET ${setClauses.join(", ")} WHERE id = ?`)
+    .run(...values);
+}
+
+// ── Execution History ───────────────────────────────────────
+
+export function insertExecution(exec: {
+  id: string;
+  taskId: string;
+  firedAt: string;
+  status: "running" | "success" | "error" | "skipped" | "cancelled";
+}): void {
+  getDb()
+    .query(
+      `INSERT INTO scheduler_task_executions (id, task_id, fired_at, status)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(exec.id, exec.taskId, exec.firedAt, exec.status);
+}
+
+export function completeExecution(
+  id: string,
+  status: "success" | "error",
+  durationMs: number,
+  error?: string,
+  output?: string,
+): void {
+  getDb()
+    .query(
+      `UPDATE scheduler_task_executions
+       SET status = ?, completed_at = ?, duration_ms = ?, error = ?, output = ?
+       WHERE id = ?`,
+    )
+    .run(status, new Date().toISOString(), durationMs, error ?? null, output ?? null, id);
+}
+
+export function getExecutionsForTask(taskId: string, limit = 50): ExecutionRow[] {
+  return getDb()
+    .query(
+      `SELECT * FROM scheduler_task_executions
+       WHERE task_id = ?
+       ORDER BY fired_at DESC
+       LIMIT ?`,
+    )
+    .all(taskId, limit) as ExecutionRow[];
+}
+
+/** Statuses of the task's finished runs (success or error), newest first. */
+export function getRecentOutcomes(taskId: string, limit: number): string[] {
+  const rows = getDb()
+    .query(
+      `SELECT status FROM scheduler_task_executions
+       WHERE task_id = ? AND status IN ('success', 'error')
+       ORDER BY fired_at DESC
+       LIMIT ?`,
+    )
+    .all(taskId, limit) as Array<{ status: string }>;
+  return rows.map((r) => r.status);
+}
+
+/**
+ * Find the latest running execution for a task. Used by scheduler.update_progress
+ * to attach progress messages to the in-flight run when only a taskId is given.
+ */
+export function getLatestRunningExecution(taskId: string): ExecutionRow | null {
+  const row = getDb()
+    .query(
+      `SELECT * FROM scheduler_task_executions
+       WHERE task_id = ? AND status = 'running'
+       ORDER BY fired_at DESC
+       LIMIT 1`,
+    )
+    .get(taskId) as ExecutionRow | null;
+  return row ?? null;
+}
+
+/**
+ * Update the progress_message field on an execution row.
+ * Identifies the row either by execution id or by (taskId, latest running).
+ */
+export function updateExecutionProgress(executionId: string, message: string): boolean {
+  const result = getDb()
+    .query(`UPDATE scheduler_task_executions SET progress_message = ? WHERE id = ?`)
+    .run(message, executionId);
+  return result.changes > 0;
+}
+
+export function pruneExecutions(taskId: string, keepCount: number): void {
+  getDb()
+    .query(
+      `DELETE FROM scheduler_task_executions
+       WHERE task_id = ? AND id NOT IN (
+         SELECT id FROM scheduler_task_executions
+         WHERE task_id = ?
+         ORDER BY fired_at DESC
+         LIMIT ?
+       )`,
+    )
+    .run(taskId, taskId, keepCount);
+}
+
+// ── Migration from JSON ─────────────────────────────────────
+
+export interface LegacyTask {
+  id: string;
+  name: string;
+  description?: string;
+  type: "once" | "interval";
+  fireAt: string;
+  intervalSeconds?: number;
+  action: {
+    type: "emit" | "extension_call" | "notification" | "exec";
+    target: string;
+    payload?: Record<string, unknown>;
+  };
+  enabled: boolean;
+  createdAt: string;
+  firedCount: number;
+}
+
+export function migrateLegacyTasks(legacyTasks: LegacyTask[]): number {
+  let count = 0;
+  const d = getDb();
+
+  const insertStmt = d.query(
+    `INSERT OR IGNORE INTO scheduler_tasks
+     (id, name, description, type, fire_at, interval_seconds, cron_expr,
+      action_type, action_target, action_payload,
+      missed_policy, concurrency, start_deadline_seconds,
+      enabled, tags, created_at, fired_count, last_fired_at, keep_history, output_dir)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  for (const task of legacyTasks) {
+    const result = insertStmt.run(
+      task.id,
+      task.name,
+      task.description ?? null,
+      task.type,
+      task.fireAt,
+      task.intervalSeconds ?? null,
+      null, // cron_expr
+      task.action.type,
+      task.action.target,
+      task.action.payload ? JSON.stringify(task.action.payload) : null,
+      "fire_once", // missed_policy default
+      "skip_if_running", // concurrency default
+      null, // start_deadline_seconds
+      task.enabled ? 1 : 0,
+      null, // tags
+      task.createdAt,
+      task.firedCount,
+      null, // last_fired_at
+      50, // keep_history default
+      null, // output_dir
+    );
+    if (result.changes > 0) count++;
+  }
+
+  return count;
+}

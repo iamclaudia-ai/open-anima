@@ -1,0 +1,52 @@
+/**
+ * ThinkingIndicator - Animated thinking indicator with circuit brain
+ * Event-driven animation that advances with each agent event
+ */
+
+import ThinkingFrame from "./ThinkingFrame";
+
+interface ThinkingIndicatorProps {
+  count?: number;
+  streamCount?: number;
+  simulatedCount?: number;
+  showCounters?: boolean;
+  size?: "sm" | "md" | "lg";
+  speed?: number;
+  isActive?: boolean;
+  inactivityTimeout?: number;
+}
+
+export function ThinkingIndicator({
+  count = 0,
+  streamCount = 0,
+  simulatedCount = 0,
+  showCounters = true,
+  size = "md",
+  speed = 1,
+  isActive = true,
+  inactivityTimeout = 60000,
+}: ThinkingIndicatorProps) {
+  const adjustedCount = Math.floor(count / speed);
+  const sizeClasses = {
+    sm: "size-12",
+    md: "size-24",
+    lg: "size-32",
+  };
+
+  return (
+    <div className="flex flex-col items-center justify-center gap-1">
+      <ThinkingFrame
+        count={adjustedCount}
+        isActive={isActive}
+        inactivityTimeout={inactivityTimeout}
+        className={`${sizeClasses[size]} transition-opacity duration-100`}
+      />
+      {showCounters && (
+        <div className="text-xs font-medium text-blue-700 tabular-nums select-none">
+          <span className="mr-2">● {streamCount}</span>
+          <span>🔵 {simulatedCount}</span>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,1634 @@
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  mock,
+  spyOn,
+} from "bun:test";
+import type { ExtensionContext } from "@anima/shared";
+import { clearConfigCache } from "@anima/shared";
+import { createSessionExtension } from "./index";
+import { AgentHostClient } from "./agent-client";
+import { getStoredSession, upsertSession } from "./session-store";
+import { discoverSessions, resolveProjectDir } from "./claude-projects";
+import * as workspace from "./workspace";
+import * as workspaceDb from "./workspace-db";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import * as os from "node:os";
+
+const testHome = join("/tmp", `anima-test-home-${Date.now()}`);
+mkdirSync(testHome, { recursive: true });
+
+const sessionId = "session-test-123";
+
+/**
+ * Narrow a `session.list_sessions` result to a case's own fixture sessions.
+ *
+ * `list_sessions` reads from SQLite rather than scanning the filesystem, and
+ * the table outlives an individual case in this file — so a bare length
+ * assertion also counts sessions other cases created. Filtering keeps each
+ * assertion about its own fixtures while preserving returned order, so recency
+ * sorting is still verifiable.
+ */
+function onlyFixtures<T extends { sessionId: string }>(sessions: T[], ids: string[]): T[] {
+  const wanted = new Set(ids);
+  return sessions.filter((session) => wanted.has(session.sessionId));
+}
+
+function createTestContext(overrides: Partial<ExtensionContext> = {}): ExtensionContext {
+  return {
+    on: () => () => {},
+    emit: () => {},
+    async call() {
+      throw new Error("Not implemented in test");
+    },
+    connectionId: null,
+    tags: null,
+    config: {},
+    log: {
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+      child: () => ({
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        child: () => {
+          throw new Error("not implemented");
+        },
+      }),
+    },
+    createLogger: () => ({
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+      child() {
+        return this;
+      },
+    }),
+    store: (() => {
+      const _data: Record<string, unknown> = {};
+      return {
+        get: <T = unknown>(key: string): T | undefined => _data[key] as T | undefined,
+        set: (key: string, value: unknown) => {
+          _data[key] = value;
+        },
+        delete: (key: string) => {
+          delete _data[key];
+          return true;
+        },
+        all: () => _data,
+      };
+    })(),
+    ...overrides,
+  };
+}
+
+// Captured before any case replaces the global, so the fail-fast guard below
+// still has a working clock while setTimeout is being recorded.
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+
+/**
+ * Replace setTimeout with a recorder, so a case can fire one timer on demand.
+ *
+ * Timers are found by their delay, never by position. `start()` registers its
+ * own background timers (the ref validator's 60s startup delay), so "the first
+ * timer" is not the one under test. Firing it by position once left the
+ * awaited promise pending forever, and with setTimeout replaced, Bun's
+ * per-test timeout could not fire either: the whole file hung.
+ *
+ * A recorder left in place outlives the file: every later test file in the
+ * same `bun test` process gets a setTimeout that never fires, and the run
+ * stalls at 0% CPU in whichever file first waits on a timer. That happened
+ * when `createSessionExtension()` threw (no config) before a case's `finally`,
+ * so `afterEach` now restores every spy, this one included.
+ */
+function recordTimers() {
+  const timers: Array<{ delay: number; fire: () => void }> = [];
+  const timeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+    cb: (...args: unknown[]) => void,
+    delay?: number,
+  ) => {
+    timers.push({ delay: Number(delay ?? 0), fire: () => cb() });
+    return timers.length as unknown as ReturnType<typeof setTimeout>;
+  }) as unknown as typeof setTimeout);
+  const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+
+  return {
+    /** Wait (a few microtask turns) for a timer with this delay, then fire it. */
+    async fire(delay: number): Promise<void> {
+      for (let i = 0; i < 50; i++) {
+        const timer = timers.find((t) => t.delay === delay);
+        if (timer) {
+          timer.fire();
+          return;
+        }
+        await Promise.resolve();
+      }
+      const seen = timers.map((t) => t.delay).join(", ") || "none";
+      throw new Error(`No ${delay}ms timer was registered (saw: ${seen})`);
+    },
+    restore(): void {
+      timeoutSpy.mockRestore();
+      clearSpy.mockRestore();
+    },
+  };
+}
+
+/** Fail with a message, instead of hanging the file, if a promise never settles. */
+function settleWithin<T>(promise: Promise<T>, ms = 2_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = realSetTimeout(() => reject(new Error(`Did not settle within ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => realClearTimeout(timer));
+}
+
+describe("session extension", () => {
+  let promptSpy: ReturnType<typeof spyOn>;
+  let emitEventSpy: ReturnType<typeof spyOn>;
+  let createSpy: ReturnType<typeof spyOn>;
+  let interruptSpy: ReturnType<typeof spyOn>;
+  let closeSpy: ReturnType<typeof spyOn>;
+  let listSpy: ReturnType<typeof spyOn>;
+  let setPermissionModeSpy: ReturnType<typeof spyOn>;
+  let sendToolResultSpy: ReturnType<typeof spyOn>;
+  let spawnSubagentSpy: ReturnType<typeof spyOn>;
+  let listWorkspacesSpy: ReturnType<typeof spyOn>;
+  let getWorkspaceSpy: ReturnType<typeof spyOn>;
+  let getOrCreateWorkspaceSpy: ReturnType<typeof spyOn>;
+  let closeDbSpy: ReturnType<typeof spyOn>;
+  let connectSpy: ReturnType<typeof spyOn>;
+  let disconnectSpy: ReturnType<typeof spyOn>;
+  let homedirSpy: ReturnType<typeof spyOn>;
+  let lastAgentClient: AgentHostClient | null;
+
+  // The config each case writes lives in testHome, and so do the Claude Code
+  // transcripts the history cases read: point both HOME and ANIMA_HOME there
+  // (the preload's ANIMA_HOME would otherwise win over HOME), and put them
+  // back so later files in the same process see the preload's values.
+  const originalHome = process.env.HOME;
+  const originalAnimaHome = process.env.ANIMA_HOME;
+  beforeAll(() => {
+    process.env.HOME = testHome;
+    process.env.ANIMA_HOME = testHome;
+  });
+  afterAll(() => {
+    process.env.HOME = originalHome;
+    process.env.ANIMA_HOME = originalAnimaHome;
+  });
+
+  beforeEach(() => {
+    clearConfigCache();
+    lastAgentClient = null;
+    mkdirSync(join(testHome, ".anima"), { recursive: true });
+    writeFileSync(
+      join(testHome, ".anima", "anima.json"),
+      JSON.stringify({
+        gateway: { port: 30086, host: "localhost" },
+        extensions: {
+          session: {
+            enabled: true,
+            config: { model: "claude-opus-4-6", thinking: false, effort: "medium" },
+          },
+        },
+      }),
+      "utf-8",
+    );
+    homedirSpy = spyOn(os, "homedir").mockReturnValue(testHome);
+    emitEventSpy = spyOn(AgentHostClient.prototype, "emit");
+    connectSpy = spyOn(AgentHostClient.prototype, "connect").mockImplementation(function (
+      this: AgentHostClient,
+    ) {
+      (this as unknown as { _isConnected: boolean })._isConnected = true;
+      return Promise.resolve();
+    });
+    disconnectSpy = spyOn(AgentHostClient.prototype, "disconnect").mockImplementation(function (
+      this: AgentHostClient,
+    ) {
+      (this as unknown as { _isConnected: boolean })._isConnected = false;
+    });
+    createSpy = spyOn(AgentHostClient.prototype, "createSession").mockImplementation(
+      async (params: { sessionId?: string }) => ({
+        sessionId: params.sessionId || "created-session-1",
+      }),
+    );
+    interruptSpy = spyOn(AgentHostClient.prototype, "interrupt").mockResolvedValue(true);
+    closeSpy = spyOn(AgentHostClient.prototype, "close").mockResolvedValue(undefined);
+    listSpy = spyOn(AgentHostClient.prototype, "list").mockResolvedValue([
+      {
+        id: sessionId,
+        cwd: "/repo/project",
+        model: "claude-test",
+        isActive: true,
+        isProcessRunning: true,
+        createdAt: new Date().toISOString(),
+        healthy: true,
+        stale: false,
+        lastActivity: new Date().toISOString(),
+      },
+    ]);
+    setPermissionModeSpy = spyOn(AgentHostClient.prototype, "setPermissionMode").mockResolvedValue(
+      true,
+    );
+    sendToolResultSpy = spyOn(AgentHostClient.prototype, "sendToolResult").mockResolvedValue(true);
+    spawnSubagentSpy = spyOn(AgentHostClient.prototype, "spawnSubagent").mockImplementation(
+      async function (
+        this: AgentHostClient,
+        params: { subagentId?: string; parentSessionId: string },
+      ) {
+        lastAgentClient = this;
+        return {
+          subagentId: params.subagentId || "subagent_123",
+          sessionId: params.subagentId || "subagent_123",
+          parentSessionId: params.parentSessionId,
+          status: "running",
+          message: "spawned",
+        };
+      },
+    );
+    listWorkspacesSpy = spyOn(workspace, "listWorkspaces").mockReturnValue([
+      {
+        id: "ws-1",
+        name: "project",
+        cwd: "/repo/project",
+        general: false,
+        pinned: false,
+        cwdDisplay: "/repo/project",
+        description: null,
+        aliases: [],
+        githubRepo: null,
+        createdAt: "2026-02-22T00:00:00.000Z",
+        updatedAt: "2026-02-22T00:00:00.000Z",
+        deletedAt: null,
+      },
+    ]);
+    getWorkspaceSpy = spyOn(workspaceDb, "getWorkspace").mockReturnValue({
+      id: "ws-1",
+      name: "project",
+      cwd: "/repo/project",
+      general: false,
+      pinned: false,
+      cwdDisplay: "/repo/project",
+      description: null,
+      aliases: [],
+      githubRepo: null,
+      createdAt: "2026-02-22T00:00:00.000Z",
+      updatedAt: "2026-02-22T00:00:00.000Z",
+      deletedAt: null,
+    });
+    // One workspace row for every folder, at the folder asked for: the
+    // reconciler sweeps the workspace's own folders, so its cwd must be real.
+    getOrCreateWorkspaceSpy = spyOn(workspace, "getOrCreateWorkspace").mockImplementation(
+      (cwd: string) => ({
+        workspace: {
+          id: "ws-2",
+          name: "new-project",
+          cwd,
+          general: false,
+          pinned: false,
+          cwdDisplay: cwd,
+          description: null,
+          aliases: [],
+          githubRepo: null,
+          createdAt: "2026-02-22T00:00:00.000Z",
+          updatedAt: "2026-02-22T00:00:00.000Z",
+          deletedAt: null,
+        },
+        created: true,
+      }),
+    );
+    closeDbSpy = spyOn(workspaceDb, "closeDb").mockImplementation(() => {});
+
+    promptSpy = spyOn(AgentHostClient.prototype, "prompt").mockImplementation(function (
+      this: AgentHostClient,
+      sid: string,
+    ) {
+      this.emit("session.event", {
+        eventName: `session.${sid}.content_block_delta`,
+        sessionId: sid,
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "Hello " },
+      });
+
+      this.emit("session.event", {
+        eventName: `session.${sid}.content_block_delta`,
+        sessionId: sid,
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "world" },
+      });
+
+      this.emit("session.event", {
+        eventName: `session.${sid}.turn_stop`,
+        sessionId: sid,
+        type: "turn_stop",
+      });
+
+      return Promise.resolve();
+    });
+  });
+
+  afterEach(() => {
+    // Every spy, including ones a failed case never reached its own restore
+    // for (setTimeout, Date.now, workspace.deleteWorkspace): a spy left in
+    // place leaks into every later file in the same `bun test` process.
+    mock.restore();
+    clearConfigCache();
+    homedirSpy.mockRestore();
+    promptSpy.mockRestore();
+    emitEventSpy.mockRestore();
+    createSpy.mockRestore();
+    interruptSpy.mockRestore();
+    closeSpy.mockRestore();
+    listSpy.mockRestore();
+    setPermissionModeSpy.mockRestore();
+    sendToolResultSpy.mockRestore();
+    spawnSubagentSpy.mockRestore();
+    listWorkspacesSpy.mockRestore();
+    getWorkspaceSpy.mockRestore();
+    getOrCreateWorkspaceSpy.mockRestore();
+    closeDbSpy.mockRestore();
+    connectSpy.mockRestore();
+    disconnectSpy.mockRestore();
+  });
+
+  it("returns accumulated text for non-streaming prompts", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const result = (await ext.handleMethod("session.send_prompt", {
+      sessionId,
+      content: "ping",
+      streaming: false,
+    })) as { text: string; sessionId: string; stopReason: string };
+
+    expect(result).toEqual({ text: "Hello world", sessionId, stopReason: "unknown" });
+
+    await ext.stop();
+  });
+
+  it("keeps prompt state isolated across concurrent sessions", async () => {
+    promptSpy.mockImplementation(function (this: AgentHostClient, sid: string) {
+      return new Promise<void>((resolve) => {
+        const chunks =
+          sid === "session-a"
+            ? [
+                { at: 0, text: "Alpha " },
+                { at: 20, text: "done" },
+              ]
+            : [
+                { at: 5, text: "Beta " },
+                { at: 10, text: "done" },
+              ];
+
+        for (const chunk of chunks) {
+          setTimeout(() => {
+            this.emit("session.event", {
+              eventName: `session.${sid}.content_block_delta`,
+              sessionId: sid,
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: chunk.text },
+            });
+          }, chunk.at);
+        }
+
+        setTimeout(
+          () => {
+            this.emit("session.event", {
+              eventName: `session.${sid}.turn_stop`,
+              sessionId: sid,
+              type: "turn_stop",
+            });
+            resolve();
+          },
+          sid === "session-a" ? 25 : 15,
+        );
+      });
+    });
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const promptA = ext.handleMethod("session.send_prompt", {
+      sessionId: "session-a",
+      content: "alpha",
+      streaming: false,
+    }) as Promise<{ text: string; sessionId: string; stopReason: string }>;
+
+    const promptB = ext.handleMethod("session.send_prompt", {
+      sessionId: "session-b",
+      content: "beta",
+      streaming: false,
+    }) as Promise<{ text: string; sessionId: string; stopReason: string }>;
+
+    const listed = (await ext.handleMethod("session.list_workspaces", {})) as {
+      workspaces: Array<{ id: string }>;
+    };
+
+    const [resultA, resultB] = await Promise.all([promptA, promptB]);
+
+    expect(listed.workspaces).toHaveLength(1);
+    expect(resultA).toEqual({
+      text: "Alpha done",
+      sessionId: "session-a",
+      stopReason: "unknown",
+    });
+    expect(resultB).toEqual({
+      text: "Beta done",
+      sessionId: "session-b",
+      stopReason: "unknown",
+    });
+
+    await ext.stop();
+  });
+
+  it("propagates envelope data to async stream events", async () => {
+    const emitted: Array<{ eventName: string; options?: Record<string, unknown> }> = [];
+
+    const ext = createSessionExtension();
+    await ext.start(
+      createTestContext({
+        connectionId: "conn-voice-1",
+        tags: ["voice"],
+        emit: (eventName, _payload, options) => {
+          emitted.push({ eventName, options: options as Record<string, unknown> | undefined });
+        },
+      }),
+    );
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId,
+      content: "ping",
+      streaming: false,
+      source: "chatbridge/room-42",
+    });
+
+    const deltaEvent = emitted.find((e) => e.eventName.endsWith("content_block_delta"));
+    expect(deltaEvent).toBeDefined();
+    expect(deltaEvent?.options).toEqual({
+      source: "chatbridge/room-42",
+      connectionId: "conn-voice-1",
+      tags: ["voice"],
+    });
+
+    await ext.stop();
+  });
+
+  it("returns immediately for streaming prompts", async () => {
+    promptSpy.mockImplementation(() => Promise.resolve());
+
+    const ext = createSessionExtension();
+    await ext.start(
+      createTestContext({
+        async call(method) {
+          if (method === "memory.transition_conversation") return { transitioned: 0 };
+          if (method === "memory.get_session_context") {
+            return { recentMessages: [], recentSummaries: [] };
+          }
+          return null;
+        },
+      }),
+    );
+
+    const result = (await ext.handleMethod("session.send_prompt", {
+      sessionId,
+      content: "ping",
+      streaming: true,
+    })) as { status: string; sessionId: string };
+
+    expect(result).toEqual({ status: "streaming", sessionId });
+    expect(promptSpy).toHaveBeenCalledTimes(1);
+    expect(promptSpy).toHaveBeenCalledWith(
+      sessionId,
+      "ping",
+      "/repo/project",
+      "claude-test",
+      "claude",
+      "yolo",
+    );
+
+    await ext.stop();
+  });
+
+  it("propagates envelope data in streaming mode for async events", async () => {
+    const emitted: Array<{ eventName: string; options?: Record<string, unknown> }> = [];
+
+    promptSpy.mockImplementation(function (this: AgentHostClient, sid: string) {
+      queueMicrotask(() => {
+        this.emit("session.event", {
+          eventName: `session.${sid}.content_block_delta`,
+          sessionId: sid,
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "stream" },
+        });
+      });
+      return Promise.resolve();
+    });
+
+    const ext = createSessionExtension();
+    await ext.start(
+      createTestContext({
+        connectionId: "conn-stream-1",
+        tags: ["voice", "realtime"],
+        emit: (eventName, _payload, options) => {
+          emitted.push({ eventName, options: options as Record<string, unknown> | undefined });
+        },
+      }),
+    );
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId,
+      content: "ping",
+      streaming: true,
+      source: "chat/browser",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const deltaEvent = emitted.find((e) => e.eventName.endsWith("content_block_delta"));
+    expect(deltaEvent).toBeDefined();
+    expect(deltaEvent?.options).toEqual({
+      source: "chat/browser",
+      connectionId: "conn-stream-1",
+      tags: ["voice", "realtime"],
+    });
+
+    await ext.stop();
+  });
+
+  it("rejects non-streaming prompt when manager.prompt fails", async () => {
+    promptSpy.mockImplementation(() => Promise.reject(new Error("prompt failed")));
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    await expect(
+      ext.handleMethod("session.send_prompt", {
+        sessionId,
+        content: "ping",
+        streaming: false,
+      }),
+    ).rejects.toThrow("prompt failed");
+
+    expect(emitEventSpy).not.toHaveBeenCalledWith(
+      "session.event",
+      expect.objectContaining({ type: "turn_stop" }),
+    );
+
+    await ext.stop();
+  });
+
+  it("creates sessions via session.create_session", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const result = await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+      model: "claude-opus",
+      systemPrompt: "You are strict",
+      thinking: true,
+      effort: "high",
+    });
+
+    expect(result).toMatchObject({ sessionId: expect.any(String) });
+    expect(createSpy).not.toHaveBeenCalled();
+
+    await ext.stop();
+  });
+
+  it("uses extension config model defaults when params do not override", async () => {
+    const ext = createSessionExtension({
+      model: "claude-opus-4-6",
+      thinking: true,
+      effort: "high",
+    });
+    await ext.start(createTestContext());
+
+    await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+    });
+
+    expect(createSpy).not.toHaveBeenCalled();
+
+    await ext.stop();
+  });
+
+  it("requests global archived summaries only for general workspaces", async () => {
+    const memoryCalls: Array<Record<string, unknown>> = [];
+    const workspacesByCwd = new Map<
+      string,
+      {
+        id: string;
+        name: string;
+        cwd: string;
+        general: boolean;
+        cwdDisplay: string;
+        createdAt: string;
+        updatedAt: string;
+      }
+    >();
+    getOrCreateWorkspaceSpy.mockImplementation((cwd: string, name?: string, general?: boolean) => {
+      const existing = workspacesByCwd.get(cwd);
+      if (existing) {
+        return { workspace: existing, created: false };
+      }
+
+      const workspace = {
+        id: cwd === "/repo/general" ? "ws-general" : "ws-project",
+        name: name || cwd.split("/").pop() || "workspace",
+        cwd,
+        general: general === true,
+        cwdDisplay: cwd,
+        createdAt: "2026-02-22T00:00:00.000Z",
+        updatedAt: "2026-02-22T00:00:00.000Z",
+      };
+      workspacesByCwd.set(cwd, workspace);
+      return { workspace, created: true };
+    });
+
+    const ext = createSessionExtension();
+    await ext.start(
+      createTestContext({
+        async call(method, params) {
+          if (method === "memory.transition_conversation") return { transitioned: 0 };
+          if (method === "memory.get_session_context") {
+            memoryCalls.push(params || {});
+            return { recentMessages: [], recentSummaries: [] };
+          }
+          return null;
+        },
+      }),
+    );
+
+    await ext.handleMethod("session.get_or_create_workspace", {
+      cwd: "/repo/general",
+      name: "General",
+      general: true,
+    });
+    const generalResult = (await ext.handleMethod("session.create_session", {
+      cwd: "/repo/general",
+    })) as { sessionId: string };
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: generalResult.sessionId,
+      cwd: "/repo/general",
+      content: "hello",
+    });
+
+    await ext.handleMethod("session.get_or_create_workspace", {
+      cwd: "/repo/project",
+      name: "Project",
+      general: false,
+      pinned: false,
+    });
+    const projectResult = (await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+    })) as { sessionId: string };
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: projectResult.sessionId,
+      cwd: "/repo/project",
+      content: "hello",
+    });
+
+    expect(memoryCalls).toEqual([
+      { cwd: "/repo/general", includeAllSummaries: true },
+      { cwd: "/repo/project", includeAllSummaries: false },
+    ]);
+
+    await ext.stop();
+  });
+
+  it("fails open when memory transition hangs during first-prompt bootstrap", async () => {
+    const timers = recordTimers();
+    const ext = createSessionExtension();
+    try {
+      await ext.start(
+        createTestContext({
+          async call(method) {
+            if (method === "memory.transition_conversation") {
+              return new Promise(() => undefined);
+            }
+            if (method === "memory.get_session_context") {
+              return { recentMessages: [], recentSummaries: [] };
+            }
+            return null;
+          },
+        }),
+      );
+
+      const created = (await ext.handleMethod("session.create_session", {
+        cwd: "/repo/project",
+      })) as { sessionId: string };
+      const pending = ext.handleMethod("session.send_prompt", {
+        sessionId: created.sessionId,
+        cwd: "/repo/project",
+        content: "hello",
+      });
+      // MEMORY_TRANSITION_TIMEOUT_MS in lifecycle/prompt-lifecycle.ts.
+      await timers.fire(1_500);
+
+      await expect(settleWithin(pending)).resolves.toEqual({
+        status: "streaming",
+        sessionId: created.sessionId,
+      });
+      expect(createSpy).toHaveBeenCalledWith({
+        sessionId: created.sessionId,
+        agent: "claude",
+        cwd: "/repo/project",
+        model: "claude-opus-4-6",
+        profile: "yolo",
+        systemPrompt: expect.stringContaining("Current local date and time:"),
+        thinking: false,
+        effort: "medium",
+      });
+    } finally {
+      timers.restore();
+      await ext.stop();
+    }
+  });
+
+  it("bootstraps memory on the first prompt for draft sessions", async () => {
+    const ext = createSessionExtension();
+    await ext.start(
+      createTestContext({
+        async call(method) {
+          if (method === "memory.transition_conversation") return { transitioned: 1 };
+          if (method === "memory.get_session_context") {
+            return {
+              recentMessages: [
+                {
+                  role: "user",
+                  content: "continue where we left off",
+                  timestamp: "2026-02-22T12:00:00.000Z",
+                },
+              ],
+              recentSummaries: [],
+            };
+          }
+          return null;
+        },
+      }),
+    );
+
+    const created = (await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+      systemPrompt: "You are strict",
+      thinking: true,
+      effort: "high",
+    })) as { sessionId: string };
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: created.sessionId,
+      cwd: "/repo/project",
+      content: "hello",
+    });
+
+    expect(createSpy).toHaveBeenCalledWith({
+      sessionId: created.sessionId,
+      agent: "claude",
+      cwd: "/repo/project",
+      model: "claude-opus-4-6",
+      profile: "yolo",
+      systemPrompt: expect.stringContaining("You are strict"),
+      thinking: true,
+      effort: "high",
+    });
+
+    await ext.stop();
+  });
+
+  it("skips bootstrap when a persisted session file already exists", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const created = (await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+    })) as { sessionId: string };
+
+    const persistedDir = join(testHome, ".claude", "projects", "-repo-project");
+    mkdirSync(persistedDir, { recursive: true });
+    writeFileSync(join(persistedDir, `${created.sessionId}.jsonl`), "", "utf-8");
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: created.sessionId,
+      cwd: "/repo/project",
+      content: "hello",
+    });
+
+    expect(createSpy).not.toHaveBeenCalled();
+
+    await ext.stop();
+  });
+
+  it("tracks session message timestamps and skips elapsed reminder without prior assistant metadata", async () => {
+    let capturedContent: string | unknown[] | undefined;
+    promptSpy.mockImplementationOnce(function (
+      this: AgentHostClient,
+      sid: string,
+      content: string | unknown[],
+    ) {
+      capturedContent = content;
+      this.emit("session.event", {
+        eventName: `session.${sid}.content_block_delta`,
+        sessionId: sid,
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "fresh answer" },
+      });
+      this.emit("session.event", {
+        eventName: `session.${sid}.turn_stop`,
+        sessionId: sid,
+        type: "turn_stop",
+      });
+      return Promise.resolve();
+    });
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const created = (await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+    })) as { sessionId: string };
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: created.sessionId,
+      cwd: "/repo/project",
+      content: "hello",
+    });
+
+    expect(capturedContent).toBe("hello");
+    const stored = getStoredSession(created.sessionId);
+    expect(Date.parse(String(stored?.metadata?.lastUserMessageAt))).toBeGreaterThan(0);
+    expect(Date.parse(String(stored?.metadata?.lastAssistantMessageAt))).toBeGreaterThan(0);
+    expect(stored?.metadata?.lastAssistantMessagePreview).toBeUndefined();
+
+    await ext.stop();
+  });
+
+  it("injects elapsed time reminder when prior assistant output is stale", async () => {
+    let capturedContent: string | unknown[] | undefined;
+    promptSpy.mockImplementationOnce(function (
+      this: AgentHostClient,
+      sid: string,
+      content: string | unknown[],
+    ) {
+      capturedContent = content;
+      this.emit("session.event", {
+        eventName: `session.${sid}.turn_stop`,
+        sessionId: sid,
+        type: "turn_stop",
+      });
+      return Promise.resolve();
+    });
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const created = (await ext.handleMethod("session.create_session", {
+      cwd: "/repo/project",
+    })) as { sessionId: string };
+    const stored = getStoredSession(created.sessionId);
+    expect(stored).toBeTruthy();
+    upsertSession({
+      id: created.sessionId,
+      workspaceId: stored!.workspaceId,
+      providerSessionId: created.sessionId,
+      model: stored!.model,
+      agent: stored!.agent,
+      purpose: stored!.purpose,
+      runtimeStatus: stored!.runtimeStatus,
+      metadata: {
+        ...(stored!.metadata || {}),
+        lastAssistantMessageAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: created.sessionId,
+      cwd: "/repo/project",
+      content: "hello again",
+    });
+
+    expect(typeof capturedContent).toBe("string");
+    expect(capturedContent as string).toContain("<system-reminder>");
+    expect(capturedContent as string).toContain("Current local date and time:");
+    expect(capturedContent as string).toContain("Time since last assistant message:");
+    expect(capturedContent as string).not.toContain("Last assistant message preview:");
+    expect(capturedContent as string).toContain("hello again");
+
+    await ext.stop();
+  });
+
+  it("spawns child agents as child sessions and routes their stream", async () => {
+    const emitted: Array<{
+      eventName: string;
+      payload: Record<string, unknown>;
+      options?: Record<string, unknown>;
+    }> = [];
+
+    const ext = createSessionExtension();
+    await ext.start(
+      createTestContext({
+        connectionId: "conn-subagent-1",
+        tags: ["voice.speak"],
+        emit: (eventName, payload, options) => {
+          emitted.push({
+            eventName,
+            payload: payload as Record<string, unknown>,
+            options: options as Record<string, unknown> | undefined,
+          });
+        },
+      }),
+    );
+
+    const started = (await ext.handleMethod("session.spawn_agent", {
+      parentSessionId: sessionId,
+      agent: "codex",
+      prompt: "review this",
+      purpose: "subagent",
+    })) as Record<string, unknown>;
+
+    const subagentId = String(started.subagentId);
+    expect(subagentId).toMatch(/[0-9a-f-]{36}/);
+    expect(started.status).toBe("running");
+    expect(spawnSubagentSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentSessionId: sessionId,
+        cwd: "/repo/project",
+        agent: "codex",
+        subagentId,
+      }),
+    );
+
+    lastAgentClient?.emit("session.event", {
+      eventName: `session.${subagentId}.content_block_delta`,
+      sessionId: subagentId,
+      type: "content_block_delta",
+      delta: { type: "text_delta", text: "delta" },
+    });
+
+    const mapped = emitted.find((e) => e.eventName === `session.${subagentId}.content_block_delta`);
+    expect(mapped).toBeDefined();
+    expect(mapped?.options).toEqual({
+      source: "gateway.caller",
+      connectionId: "conn-subagent-1",
+      tags: ["voice.speak"],
+    });
+
+    const listed = (await ext.handleMethod("session.list_subagents", {})) as {
+      subagents: Array<{ subagentId: string }>;
+    };
+    expect(listed.subagents.map((s) => s.subagentId)).toContain(subagentId);
+
+    await ext.stop();
+  });
+
+  it("sends a user_notification to parent session when subagent completes", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const started = (await ext.handleMethod("session.spawn_agent", {
+      parentSessionId: sessionId,
+      agent: "codex",
+      prompt: "do thing",
+      purpose: "subagent",
+    })) as { subagentId: string };
+
+    lastAgentClient?.emit("session.event", {
+      eventName: `session.${started.subagentId}.turn_stop`,
+      sessionId: started.subagentId,
+      type: "turn_stop",
+      stop_reason: "end_turn",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(promptSpy).toHaveBeenCalledWith(
+      sessionId,
+      expect.stringContaining("<user_notification>"),
+      // The parent's folder, so a parent whose process isn't running resumes.
+      "/repo/project",
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+    );
+
+    await ext.stop();
+  });
+
+  it("switches and resets sessions through manager methods", async () => {
+    createSpy.mockResolvedValueOnce({ sessionId: "reset-session-1" });
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const switched = await ext.handleMethod("session.switch_session", {
+      sessionId: "resume-1",
+      cwd: "/repo/project",
+      model: "claude-sonnet-4-6",
+    });
+    expect(promptSpy).toHaveBeenCalledWith(
+      "resume-1",
+      "",
+      "/repo/project",
+      "claude-sonnet-4-6",
+      undefined,
+      "yolo",
+    );
+    expect(switched).toEqual({ sessionId: "resume-1" });
+
+    const reset = await ext.handleMethod("session.reset_session", {
+      cwd: "/repo/project",
+      model: "claude-opus",
+    });
+    expect(createSpy).toHaveBeenCalledWith({
+      cwd: "/repo/project",
+      model: "claude-opus",
+      profile: "yolo",
+    });
+    expect(reset).toEqual({ sessionId: "reset-session-1" });
+
+    await ext.stop();
+  });
+
+  it("recycles running session when active model drifts from stored model", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    // Simulate drift: host reports claude-sonnet-4-6 while request wants opus.
+    listSpy.mockResolvedValueOnce([
+      {
+        id: "drift-session",
+        cwd: "/repo/project",
+        model: "claude-sonnet-4-6",
+        isActive: true,
+        isProcessRunning: true,
+        createdAt: new Date().toISOString(),
+        healthy: true,
+        stale: false,
+        lastActivity: new Date().toISOString(),
+      },
+    ]);
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: "drift-session",
+      cwd: "/repo/project",
+      content: "ping",
+      model: "claude-opus-4-6",
+      streaming: true,
+    });
+
+    expect(closeSpy).toHaveBeenCalledWith("drift-session");
+    expect(promptSpy).toHaveBeenCalledWith(
+      "drift-session",
+      "ping",
+      "/repo/project",
+      "claude-opus-4-6",
+      "claude",
+      "yolo",
+    );
+
+    await ext.stop();
+  });
+
+  it("does not recycle when active model differs only by context variant", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    // CLI runtime reports the bare model; request carries the [1m] variant.
+    listSpy.mockResolvedValueOnce([
+      {
+        id: "ctx-session",
+        cwd: "/repo/project",
+        model: "claude-opus-4-7",
+        isActive: true,
+        isProcessRunning: true,
+        createdAt: new Date().toISOString(),
+        healthy: true,
+        stale: false,
+        lastActivity: new Date().toISOString(),
+      },
+    ]);
+
+    await ext.handleMethod("session.send_prompt", {
+      sessionId: "ctx-session",
+      cwd: "/repo/project",
+      content: "ping",
+      model: "claude-opus-4-7[1m]",
+      streaming: true,
+    });
+
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    await ext.stop();
+  });
+
+  it("delegates interrupt/close/permission/tool_result methods", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const interrupted = await ext.handleMethod("session.interrupt_session", { sessionId: "s-1" });
+    expect(interruptSpy).toHaveBeenCalledWith("s-1");
+    expect(interrupted).toEqual({ ok: true });
+
+    const permission = await ext.handleMethod("session.set_permission_mode", {
+      sessionId: "s-1",
+      mode: "acceptEdits",
+    });
+    expect(setPermissionModeSpy).toHaveBeenCalledWith("s-1", "acceptEdits");
+    expect(permission).toEqual({ ok: true });
+
+    const toolResult = await ext.handleMethod("session.send_tool_result", {
+      sessionId: "s-1",
+      toolUseId: "tool-123",
+      content: "done",
+      isError: true,
+    });
+    expect(sendToolResultSpy).toHaveBeenCalledWith("s-1", "tool-123", "done", true);
+    expect(toolResult).toEqual({ ok: true });
+
+    const closed = await ext.handleMethod("session.close_session", { sessionId: "s-1" });
+    expect(closeSpy).toHaveBeenCalledWith("s-1");
+    expect(closed).toEqual({ ok: true });
+
+    await ext.stop();
+  });
+
+  it("returns expected info and health payloads", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const infoNoSession = (await ext.handleMethod("session.get_info", {})) as {
+      activeSessions: unknown[];
+    };
+    expect(infoNoSession.activeSessions).toHaveLength(1);
+
+    const infoWithSession = (await ext.handleMethod("session.get_info", {
+      sessionId,
+    })) as { session: { id: string } | null; activeSessions: unknown[] };
+    expect(infoWithSession.session?.id).toBe(sessionId);
+    expect(infoWithSession.activeSessions).toHaveLength(1);
+
+    const health = (await ext.handleMethod("session.health_check", {})) as {
+      ok: boolean;
+      label: string;
+      status: string;
+      metrics?: Array<{ label: string; value: string | number }>;
+      items?: Array<{ id: string; label: string; status: string }>;
+    };
+    expect(health.ok).toBe(true);
+    expect(health.label).toBe("Sessions");
+    expect(health.status).toBe("healthy");
+    expect(health.metrics?.[0]).toEqual({ label: "Agent Host", value: "connected" });
+    expect(health.items?.length).toBe(1);
+    expect(health.items?.[0]).toMatchObject({
+      id: sessionId,
+      label: "/repo/project",
+      status: "healthy",
+    });
+    expect(
+      (health.items?.[0] as { details?: Record<string, string> }).details?.lastActivityAgo,
+    ).toMatch(/ago$/);
+
+    await ext.stop();
+  });
+
+  it("throws for unknown methods", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    await expect(ext.handleMethod("session.nope", {})).rejects.toThrow(
+      "Unknown method: session.nope",
+    );
+
+    await ext.stop();
+  });
+
+  it("routes workspace CRUD methods through workspace module", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const listed = await ext.handleMethod("session.list_workspaces", {});
+    expect(listWorkspacesSpy).toHaveBeenCalledTimes(1);
+    // Pass-through: whatever the workspace module returns, unchanged.
+    expect(listed).toEqual({ workspaces: listWorkspacesSpy.mock.results[0]?.value });
+
+    const fetched = await ext.handleMethod("session.get_workspace", { id: "ws-1" });
+    expect(getWorkspaceSpy).toHaveBeenCalledWith("ws-1");
+    expect(fetched).toEqual({
+      workspace: getWorkspaceSpy.mock.results[0]?.value,
+      folders: expect.any(Array),
+    });
+
+    const created = await ext.handleMethod("session.get_or_create_workspace", {
+      cwd: "/repo/new-project",
+      name: "new-project",
+    });
+    expect(getOrCreateWorkspaceSpy).toHaveBeenCalledWith(
+      "/repo/new-project",
+      "new-project",
+      undefined,
+      { restore: true },
+    );
+    expect(created).toEqual(getOrCreateWorkspaceSpy.mock.results[0]?.value);
+
+    await ext.stop();
+  });
+
+  it("delete_workspace: an id wins over the cwd the CLI fills in, and the target is reported", async () => {
+    const deleteSpy = spyOn(workspace, "deleteWorkspace").mockReturnValue(true);
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const result = (await ext.handleMethod("session.delete_workspace", {
+      id: "ws-1",
+      cwd: "/where/the/shell/happens/to/be",
+    })) as { deleted: boolean; workspace: { id: string; cwd: string } | null };
+    const target = getWorkspaceSpy.mock.results.at(-1)?.value as { cwd: string };
+    expect(deleteSpy).toHaveBeenCalledWith(target.cwd);
+    expect(result.deleted).toBe(true);
+    expect(result.workspace).toMatchObject({ id: "ws-1", cwd: target.cwd });
+
+    getWorkspaceSpy.mockReturnValueOnce(null);
+    await expect(
+      ext.handleMethod("session.delete_workspace", { id: "ws-missing", cwd: "/x" }),
+    ).rejects.toThrow("Unknown workspace: ws-missing");
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+
+    deleteSpy.mockRestore();
+    await ext.stop();
+  });
+
+  it("lists child directories with tilde expansion and sorts dot-directories last", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+    const rootName = `anima-dir-list-${Date.now()}`;
+    const basePath = join(testHome, "Projects", rootName);
+    const tildePath = `~/Projects/${rootName}`;
+
+    try {
+      mkdirSync(join(basePath, "alpha"), { recursive: true });
+      mkdirSync(join(basePath, "beta"), { recursive: true });
+      mkdirSync(join(basePath, ".config"), { recursive: true });
+      writeFileSync(join(basePath, "README.md"), "not a directory");
+
+      const result = (await ext.handleMethod("session.get_directories", {
+        path: tildePath,
+      })) as { path: string; directories: string[] };
+
+      expect(result.path).toBe(tildePath);
+      // Dot-folders are included (many real workspaces live in them — e.g.
+      // ~/.config/*, ~/.claude/*) but sorted after regular folders for
+      // readability.
+      expect(result.directories).toEqual(["alpha", "beta", ".config"]);
+    } finally {
+      rmSync(basePath, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("returns an empty directory list for missing paths", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    try {
+      const result = (await ext.handleMethod("session.get_directories", {
+        path: "/definitely/missing/anima-path",
+      })) as { path: string; directories: string[] };
+      expect(result.directories).toEqual([]);
+    } finally {
+      await ext.stop();
+    }
+  });
+
+  it("lists sessions from ~/.claude/projects sorted by recency", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+    const cwd = `/tmp/anima-test-${Date.now()}-sessions`;
+    const encodedCwd = cwd.replace(/\//g, "-");
+    const projectDir = join(os.homedir(), ".claude", "projects", encodedCwd);
+    try {
+      mkdirSync(projectDir, { recursive: true });
+
+      writeFileSync(
+        join(projectDir, "sessions-index.json"),
+        JSON.stringify({
+          originalPath: cwd,
+          entries: [
+            {
+              sessionId: "old-session",
+              created: "2026-01-01T00:00:00.000Z",
+              modified: "2026-01-01T00:00:00.000Z",
+              messageCount: 2,
+            },
+            {
+              sessionId: "new-session",
+              created: "2026-02-22T00:00:00.000Z",
+              modified: "2026-02-22T00:00:00.000Z",
+              messageCount: 3,
+              gitBranch: "main",
+            },
+          ],
+        }),
+      );
+
+      writeFileSync(
+        join(projectDir, "old-session.jsonl"),
+        `${JSON.stringify({
+          type: "user",
+          message: { role: "user", content: "older prompt" },
+        })}\n`,
+      );
+      writeFileSync(
+        join(projectDir, "new-session.jsonl"),
+        `${JSON.stringify({
+          type: "user",
+          message: { role: "user", content: "newer prompt" },
+        })}\n`,
+      );
+
+      const result = (await ext.handleMethod("session.list_sessions", { cwd })) as {
+        sessions: Array<{ sessionId: string; firstPrompt?: string; gitBranch?: string }>;
+      };
+
+      // list_sessions reads from SQLite, which persists across cases in this
+      // file, so scope the assertion to this fixture's sessions. Ordering
+      // between them still proves the recency sort.
+      const fixtures = onlyFixtures(result.sessions, ["new-session", "old-session"]);
+      expect(fixtures).toHaveLength(2);
+      expect(fixtures[0]?.sessionId).toBe("new-session");
+      expect(fixtures[0]?.gitBranch).toBe("main");
+      expect(fixtures[0]?.firstPrompt).toBe("newer prompt");
+      expect(fixtures[1]?.sessionId).toBe("old-session");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("discovers sessions via originalPath fallback and extracts first text block prompts", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+    const cwd = `/tmp/anima-test-${Date.now()}-fallback`;
+    const fallbackDir = join(os.homedir(), ".claude", "projects", `fallback-${Date.now()}`);
+    const badDir = join(os.homedir(), ".claude", "projects", `bad-${Date.now()}`);
+
+    try {
+      mkdirSync(fallbackDir, { recursive: true });
+      mkdirSync(badDir, { recursive: true });
+
+      writeFileSync(join(badDir, "sessions-index.json"), "{ this is not json");
+      writeFileSync(
+        join(fallbackDir, "sessions-index.json"),
+        JSON.stringify({
+          originalPath: cwd,
+          entries: [{ sessionId: "fallback-session", modified: "2026-02-22T01:00:00.000Z" }],
+        }),
+      );
+      writeFileSync(
+        join(fallbackDir, "fallback-session.jsonl"),
+        `${JSON.stringify({
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "prompt from text block" }],
+          },
+        })}\n`,
+      );
+
+      const result = (await ext.handleMethod("session.list_sessions", { cwd })) as {
+        sessions: Array<{ sessionId: string; firstPrompt?: string }>;
+      };
+      const fixtures = onlyFixtures(result.sessions, ["fallback-session"]);
+      expect(fixtures).toHaveLength(1);
+      expect(fixtures[0]?.firstPrompt).toBe("prompt from text block");
+    } finally {
+      rmSync(fallbackDir, { recursive: true, force: true });
+      rmSync(badDir, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("handles delayed turn_stop logging path for streaming prompts", async () => {
+    const removeListenerSpy = spyOn(AgentHostClient.prototype, "removeListener");
+    promptSpy.mockImplementation(function (this: AgentHostClient, sid: string) {
+      setTimeout(() => {
+        this.emit("session.event", {
+          eventName: `session.${sid}.content_block_delta`,
+          sessionId: sid,
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "late chunk" },
+        });
+        this.emit("session.event", {
+          eventName: `session.${sid}.turn_stop`,
+          sessionId: sid,
+          type: "turn_stop",
+        });
+      }, 0);
+      return Promise.resolve();
+    });
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const result = await ext.handleMethod("session.send_prompt", {
+      sessionId,
+      content: "ping",
+      streaming: true,
+    });
+    expect(result).toEqual({ status: "streaming", sessionId });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(removeListenerSpy).toHaveBeenCalledWith("session.event", expect.any(Function));
+
+    await ext.stop();
+    removeListenerSpy.mockRestore();
+  });
+
+  it("returns paginated history and empty history when session file is missing", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+    const cwd = `/tmp/anima-test-${Date.now()}-history`;
+    const encodedCwd = cwd.replace(/\//g, "-");
+    const projectDir = join(os.homedir(), ".claude", "projects", encodedCwd);
+    try {
+      mkdirSync(projectDir, { recursive: true });
+
+      writeFileSync(
+        join(projectDir, "hist-session.jsonl"),
+        [
+          JSON.stringify({
+            type: "user",
+            timestamp: "2026-02-22T00:00:00.000Z",
+            message: { role: "user", content: "first" },
+          }),
+          JSON.stringify({
+            type: "assistant",
+            timestamp: "2026-02-22T00:00:01.000Z",
+            message: { role: "assistant", content: [{ type: "text", text: "second" }] },
+          }),
+          JSON.stringify({
+            type: "user",
+            timestamp: "2026-02-22T00:00:02.000Z",
+            message: { role: "user", content: "third" },
+          }),
+        ].join("\n") + "\n",
+      );
+
+      const paged = (await ext.handleMethod("session.get_history", {
+        sessionId: "hist-session",
+        cwd,
+        limit: 2,
+      })) as {
+        messages: Array<{ role: string }>;
+        total: number;
+        hasMore: boolean;
+        start: number;
+        before?: number;
+      };
+
+      expect(paged.total).toBe(3);
+      expect(paged.hasMore).toBe(true);
+      expect(paged.start).toBe(1);
+      expect(paged.before).toBeUndefined();
+      expect(paged.messages.map((m) => m.role)).toEqual(["assistant", "user"]);
+
+      const older = (await ext.handleMethod("session.get_history", {
+        sessionId: "hist-session",
+        cwd,
+        limit: 2,
+        before: paged.start,
+      })) as typeof paged;
+      expect(older.before).toBe(1);
+      expect(older.start).toBe(0);
+      expect(older.hasMore).toBe(false);
+      expect(older.messages.map((m) => m.role)).toEqual(["user"]);
+
+      const missing = (await ext.handleMethod("session.get_history", {
+        sessionId: "missing-session",
+        cwd,
+      })) as {
+        messages: unknown[];
+        total: number;
+        hasMore: boolean;
+        start: number;
+        claudeCode: boolean;
+        idleCompaction: boolean;
+      };
+      expect(missing).toEqual({
+        messages: [],
+        total: 0,
+        hasMore: false,
+        start: 0,
+        claudeCode: false,
+        idleCompaction: false,
+      });
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("returns empty sessions when project fallback has no matching originalPath", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+    const cwd = `/tmp/anima-test-${Date.now()}-no-fallback-match`;
+    const badDir = join(os.homedir(), ".claude", "projects", `bad-only-${Date.now()}`);
+    try {
+      mkdirSync(badDir, { recursive: true });
+      writeFileSync(join(badDir, "sessions-index.json"), "{ broken json");
+
+      // Asserted at the discovery layer rather than through
+      // `session.list_sessions`: this suite mocks `getOrCreateWorkspace` to a
+      // single fixed workspace, so every cwd shares one row set once reads come
+      // from SQLite, and an emptiness assertion there would only be measuring
+      // the mock. Discovery is where "no matching originalPath" is decided.
+      expect(resolveProjectDir(cwd)).toBeNull();
+      expect(discoverSessions(cwd)).toEqual([]);
+    } finally {
+      rmSync(badDir, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("keeps sessions when prompt extraction encounters malformed JSONL lines", async () => {
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+    const cwd = `/tmp/anima-test-${Date.now()}-malformed-prompt`;
+    const encodedCwd = cwd.replace(/\//g, "-");
+    const projectDir = join(os.homedir(), ".claude", "projects", encodedCwd);
+    try {
+      mkdirSync(projectDir, { recursive: true });
+
+      writeFileSync(
+        join(projectDir, "broken-first-prompt.jsonl"),
+        [
+          "{not-json",
+          JSON.stringify({
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "assistant only" }],
+            },
+          }),
+        ].join("\n") + "\n",
+      );
+
+      const result = (await ext.handleMethod("session.list_sessions", { cwd })) as {
+        sessions: Array<{ sessionId: string; firstPrompt?: string }>;
+      };
+      const fixtures = onlyFixtures(result.sessions, ["broken-first-prompt"]);
+      expect(fixtures).toHaveLength(1);
+      expect(fixtures[0]?.firstPrompt).toBeUndefined();
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("times out non-streaming prompts when turn_stop never arrives", async () => {
+    const timers = recordTimers();
+
+    promptSpy.mockImplementation(() => Promise.resolve());
+
+    const projectDir = join(testHome, ".claude", "projects", "-repo-project");
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), "", "utf-8");
+
+    const ext = createSessionExtension();
+    try {
+      await ext.start(createTestContext());
+      const pending = ext.handleMethod("session.send_prompt", {
+        sessionId,
+        cwd: "/repo/project",
+        model: "claude-test",
+        content: "ping",
+        streaming: false,
+      });
+      // The turn timeout passed to beginTurn in lifecycle/prompt-lifecycle.ts.
+      await timers.fire(300_000);
+      await expect(settleWithin(pending)).rejects.toThrow("Prompt timed out after 5 minutes");
+    } finally {
+      timers.restore();
+      rmSync(projectDir, { recursive: true, force: true });
+      await ext.stop();
+    }
+  });
+
+  it("executes slow-call logging path for non-read methods", async () => {
+    const nowSpy = spyOn(Date, "now");
+    nowSpy.mockImplementationOnce(() => 1_000).mockImplementationOnce(() => 1_250);
+
+    const ext = createSessionExtension();
+    await ext.start(createTestContext());
+
+    const result = await ext.handleMethod("session.create_session", { cwd: "/repo/slow" });
+    expect(result).toMatchObject({ sessionId: expect.any(String) });
+
+    await ext.stop();
+    nowSpy.mockRestore();
+  });
+});

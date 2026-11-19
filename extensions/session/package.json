@@ -1,0 +1,14 @@
+{
+  "name": "@anima/extension-session",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anima/extension-host": "workspace:*",
+    "@anima/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

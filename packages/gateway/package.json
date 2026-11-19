@@ -1,0 +1,27 @@
+{
+  "name": "@anima/gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun run src/start.ts",
+    "start": "bun run src/start.ts",
+    "build": "bun build src/start.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsgo --noEmit -p ../../tsconfig.json"
+  },
+  "dependencies": {
+    "@anima/shared": "workspace:*",
+    "@anima/ui": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "lucide-react": "catalog:",
+    "react-markdown": "catalog:",
+    "remark-gfm": "4.0.1",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "catalog:",
+    "bun-plugin-tailwind": "catalog:",
+    "tailwindcss": "catalog:"
+  }
+}

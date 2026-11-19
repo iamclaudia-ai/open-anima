@@ -1,0 +1,21 @@
+{
+  "port": 39985,
+  "services": {
+    "agent-host": {
+      "name": "Agent Host",
+      "command": ["bun", "run", "packages/agent-host/src/index.ts"],
+      "cwd": "/nonexistent/open-anima-test",
+      "healthUrl": "http://127.0.0.1:39987/health",
+      "port": 39987,
+      "drainMs": 600000
+    },
+    "gateway": {
+      "name": "Gateway",
+      "command": ["bun", "run", "packages/gateway/src/start.ts"],
+      "cwd": "/nonexistent/open-anima-test",
+      "healthUrl": "http://127.0.0.1:39986/health",
+      "port": 39986,
+      "healthCheck": { "requireExtensions": true }
+    }
+  }
+}

@@ -1,0 +1,115 @@
+import { animaLogFile, createLogger, shortId } from "@anima/shared";
+import {
+  LEGACY_SESSION_PROFILE,
+  getSessionProfile,
+  getWorkspaceActiveSession,
+  setSessionProfile,
+} from "../session-store";
+import type { AgentHostSessionInfo } from "../session-types";
+import { getRuntime } from "../runtime";
+import { sameModel } from "../model-id";
+import { callMemory } from "./memory-calls";
+
+const log = createLogger("SessionExt:Activation", animaLogFile("session.log"));
+
+const MEMORY_TRANSITION_TIMEOUT_MS = 1500;
+
+async function transitionConversation(cwd: string): Promise<void> {
+  const rt = getRuntime();
+  await callMemory({
+    call: (method, params) => rt.ctx.call(method, params),
+    method: "memory.transition_conversation",
+    params: { cwd },
+    timeoutMs: MEMORY_TRANSITION_TIMEOUT_MS,
+    log,
+    failure: "Failed to transition previous conversations (non-fatal)",
+    meta: { cwd },
+  });
+}
+
+async function recycleForModelDrift(sessionId: string, desiredModel: string): Promise<void> {
+  const rt = getRuntime();
+  const activeSessions = (await rt.bridge.listSessions()) as AgentHostSessionInfo[];
+  const activeSession = activeSessions.find((s) => s.id === sessionId);
+  if (
+    activeSession &&
+    activeSession.isProcessRunning &&
+    activeSession.model &&
+    !sameModel(activeSession.model, desiredModel)
+  ) {
+    log.warn("Detected model drift during switch; recycling session runtime", {
+      sessionId: shortId(sessionId),
+      runningModel: activeSession.model,
+      desiredModel,
+    });
+    await rt.bridge.closeSession(sessionId);
+  }
+}
+
+export async function switchSession(params: {
+  sessionId: string;
+  cwd: string;
+  model?: string;
+}): Promise<{ sessionId: string }> {
+  const rt = getRuntime();
+  const existing = rt.registry.getStoredSession(params.sessionId);
+  // Resume in the session's own folder (see resolveSessionStage): the client
+  // sends the workspace it shows, which for a worktree session is the root.
+  const cwd = existing?.cwd ?? params.cwd;
+  const workspaceResult = rt.registry.getOrCreateWorkspace(cwd);
+  await transitionConversation(cwd);
+
+  const resumeModel = params.model || existing?.model || rt.sessionConfig.model;
+  await recycleForModelDrift(params.sessionId, resumeModel);
+
+  log.info("Switching session", {
+    sessionId: shortId(params.sessionId),
+    cwd,
+    model: resumeModel,
+  });
+  await rt.bridge.prompt(params.sessionId, "", cwd, resumeModel);
+  rt.registry.upsertSession({
+    id: params.sessionId,
+    workspaceId: workspaceResult.workspace.id,
+    providerSessionId: existing?.providerSessionId || params.sessionId,
+    model: existing?.model || resumeModel,
+    agent: existing?.agent || "claude",
+    purpose: existing?.purpose || "chat",
+    cwd,
+    runtimeStatus: "idle",
+    metadata: existing?.metadata || null,
+    previousSessionId: existing?.previousSessionId ?? null,
+  });
+  rt.registry.setWorkspaceActiveSession(workspaceResult.workspace.id, params.sessionId);
+  return { sessionId: params.sessionId };
+}
+
+export async function resetSession(params: {
+  cwd: string;
+  model?: string;
+}): Promise<{ sessionId: string }> {
+  const rt = getRuntime();
+  const model = params.model || rt.sessionConfig.model;
+  const workspaceResult = rt.registry.getOrCreateWorkspace(params.cwd);
+  const previousSessionId = getWorkspaceActiveSession(workspaceResult.workspace.id);
+  await transitionConversation(params.cwd);
+
+  log.info("Resetting session", { cwd: params.cwd });
+  const profile =
+    (previousSessionId ? getSessionProfile(previousSessionId) : null) ?? LEGACY_SESSION_PROFILE;
+  const result = await rt.bridge.createSession({ cwd: params.cwd, model, profile });
+  rt.registry.upsertSession({
+    id: result.sessionId,
+    workspaceId: workspaceResult.workspace.id,
+    providerSessionId: result.sessionId,
+    model,
+    agent: "claude",
+    purpose: "chat",
+    cwd: params.cwd,
+    runtimeStatus: "idle",
+    previousSessionId,
+  });
+  setSessionProfile(result.sessionId, profile);
+  rt.registry.setWorkspaceActiveSession(workspaceResult.workspace.id, result.sessionId);
+  return result;
+}

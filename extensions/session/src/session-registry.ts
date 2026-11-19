@@ -1,0 +1,161 @@
+import type { AgentHostSessionInfo } from "./session-types";
+import {
+  getStoredSession,
+  setWorkspaceActiveSession,
+  upsertSession,
+  type StoredSession,
+  type RuntimeStatus,
+} from "./session-store";
+import {
+  deleteWorkspace,
+  detectGithubRepo,
+  findWorkspace,
+  getOrCreateWorkspace,
+  listWorkspaces,
+  setWorkspacePinned,
+  updateWorkspaceProject,
+  type WorkspaceProjectFields,
+  type WorkspaceQuery,
+} from "./workspace";
+import { getWorkspace, getWorkspaceByCwd, listWorkspaceFolders } from "./workspace-db";
+import { addFolder, moveFolder, removeFolder, setRoot } from "./workspace-folders";
+
+export class SessionRegistry {
+  /** Folder membership operations, behind `session.update_workspace`. */
+  readonly workspaceFolders = {
+    add: addFolder,
+    remove: removeFolder,
+    setRoot,
+    move: moveFolder,
+    list: listWorkspaceFolders,
+  };
+
+  updateWorkspaceProject(id: string, fields: WorkspaceProjectFields) {
+    return updateWorkspaceProject(id, fields);
+  }
+
+  findWorkspace(query: WorkspaceQuery) {
+    return findWorkspace(query);
+  }
+
+  detectGithubRepo(cwd: string) {
+    return detectGithubRepo(cwd);
+  }
+
+  getOrCreateWorkspace(
+    cwd: string,
+    name?: string,
+    general?: boolean,
+    options?: { restore?: boolean },
+  ) {
+    return getOrCreateWorkspace(cwd, name, general, options);
+  }
+
+  getWorkspace(id: string) {
+    return getWorkspace(id);
+  }
+
+  getWorkspaceByCwd(cwd: string) {
+    return getWorkspaceByCwd(cwd);
+  }
+
+  listWorkspaces(options?: { deleted?: boolean }) {
+    return listWorkspaces(options);
+  }
+
+  deleteWorkspace(cwd: string): boolean {
+    return deleteWorkspace(cwd);
+  }
+
+  setWorkspacePinned(id: string, pinned: boolean) {
+    return setWorkspacePinned(id, pinned);
+  }
+
+  getStoredSession(id: string): StoredSession | null {
+    return getStoredSession(id);
+  }
+
+  setWorkspaceActiveSession(workspaceId: string, sessionId: string): void {
+    setWorkspaceActiveSession(workspaceId, sessionId);
+  }
+
+  upsertSession(params: Parameters<typeof upsertSession>[0]): void {
+    upsertSession(params);
+  }
+
+  archiveSession(sessionId: string): void {
+    const existing = getStoredSession(sessionId);
+    if (!existing) return;
+
+    upsertSession({
+      id: existing.id,
+      workspaceId: existing.workspaceId,
+      providerSessionId: existing.providerSessionId,
+      model: existing.model,
+      agent: existing.agent,
+      purpose: existing.purpose,
+      parentSessionId: existing.parentSessionId,
+      status: "archived",
+      runtimeStatus: existing.runtimeStatus,
+      title: existing.title,
+      summary: existing.summary,
+      metadata: existing.metadata,
+      previousSessionId: existing.previousSessionId,
+      // Archiving is bookkeeping, not activity. Without this, `upsertSession`
+      // defaults `last_activity` to now and every archived session dates
+      // itself to the sweep that filed it — which is precisely the set search
+      // surfaces most, since archived means old.
+      lastActivity: existing.lastActivity,
+    });
+  }
+
+  recordConnectedSessions(sessions: AgentHostSessionInfo[]): void {
+    for (const session of sessions) {
+      if (!session.cwd) continue;
+      const existing = getStoredSession(session.id);
+      // A known session keeps the workspace, purpose and parent it was
+      // created with. A subagent runs in whatever folder it was given (often
+      // a git worktree), and adopting it by folder made that folder a
+      // workspace of its own and filed the subagent there as a parentless chat.
+      const workspaceId = existing
+        ? existing.workspaceId
+        : getOrCreateWorkspace(session.cwd).workspace.id;
+      // A live process is not a turn in flight. `isProcessRunning` is true for
+      // every attached CLI pane, so mapping it to `running` marked six live
+      // sessions permanently busy — and a dot that is always green trains you
+      // to ignore the one that matters. `running` is written by the prompt
+      // lifecycle, which is the only place that knows a turn actually started.
+      // `undefined` rather than `idle` for the healthy case: this sweep knows a
+      // process exists, which is not the same as knowing what it's doing. The
+      // lifecycle owns that, and asserting `idle` here overwrote it — a session
+      // waiting on a modal prompt was reset on the next reconnect.
+      const runtimeStatus: RuntimeStatus | undefined =
+        session.isProcessRunning && session.stale ? "stalled" : undefined;
+
+      // Adoption is not activity. Agent-host reports `lastActivity` as the
+      // moment it noticed the pane, so readopting on every reconnect was
+      // stamping live sessions with "now" — which reordered the nav on a
+      // restart and reset the clock behind "this finished 20 minutes ago and
+      // you haven't looked". A session's last activity is the last thing said
+      // in it, so an existing row keeps the value it already had.
+
+      upsertSession({
+        id: session.id,
+        workspaceId,
+        providerSessionId: session.id,
+        model: session.model,
+        agent: existing?.agent ?? "claude",
+        purpose: existing?.purpose ?? "chat",
+        parentSessionId: existing?.parentSessionId ?? null,
+        // Agent-host runs the process, so its folder is the real one.
+        cwd: session.cwd,
+        runtimeStatus,
+        lastActivity: existing?.lastActivity ?? session.lastActivity,
+      });
+
+      if (session.isActive) {
+        setWorkspaceActiveSession(workspaceId, session.id);
+      }
+    }
+  }
+}

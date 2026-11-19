@@ -1,0 +1,64 @@
+{
+  "twoShells": {
+    "session_id": "00000000-0000-4000-8000-000000000215",
+    "transcript_path": "/home/alex/.claude/projects/-home-alex-projects-anima-tmp-cc-probe-bg-run1-work/00000000-0000-4000-8000-000000000215.jsonl",
+    "cwd": "/home/alex/projects/anima/tmp/cc-probe/bg/run1/work",
+    "scratchpad_dir": "/tmp/example/claude/-home-alex-projects-anima-tmp-cc-probe-bg-run1-work/00000000-0000-4000-8000-000000000215/scratchpad",
+    "prompt_id": "00000000-0000-4000-8000-000000000214",
+    "permission_mode": "bypassPermissions",
+    "effort": {
+      "level": "medium"
+    },
+    "hook_event_name": "Stop",
+    "stop_hook_active": false,
+    "last_assistant_message": "Both are started: the `probe monitor` is armed (120s timeout, will emit `tick` after 40s), and the background shell `sleep 35; echo shell-done` is running.",
+    "background_tasks": [
+      {
+        "id": "b4lvv6fwp",
+        "type": "shell",
+        "status": "running",
+        "description": "Sleep 35 seconds then print shell-done",
+        "command": "TMUX_WRAP_SESSION=anima-wrapper-00000000-0000-4000-8000-000000000215 /home/alex/projects/anima/scripts/tmux-wrap.sh --shell sleep\\ 35\\;\\ echo\\ shell-done"
+      },
+      {
+        "id": "b495k5rzz",
+        "type": "shell",
+        "status": "running",
+        "description": "probe monitor",
+        "command": "sleep 40; echo tick"
+      }
+    ],
+    "session_crons": []
+  },
+  "agentAndCron": {
+    "session_id": "00000000-0000-4000-8000-000000000215",
+    "transcript_path": "/home/alex/.claude/projects/-home-alex-projects-anima-tmp-cc-probe-bg-run1-work/00000000-0000-4000-8000-000000000215.jsonl",
+    "cwd": "/home/alex/projects/anima/tmp/cc-probe/bg/run1/work",
+    "scratchpad_dir": "/tmp/example/claude/-home-alex-projects-anima-tmp-cc-probe-bg-run1-work/00000000-0000-4000-8000-000000000215/scratchpad",
+    "prompt_id": "00000000-0000-4000-8000-000000000221",
+    "permission_mode": "bypassPermissions",
+    "effort": {
+      "level": "medium"
+    },
+    "hook_event_name": "Stop",
+    "stop_hook_active": false,
+    "last_assistant_message": "I started a background general-purpose agent to run `sleep 30` and reply \"agent done\"; I'll report its result when it completes.",
+    "background_tasks": [
+      {
+        "id": "a0000000000000001",
+        "type": "subagent",
+        "status": "running",
+        "description": "Sleep 30 then reply",
+        "agent_type": "general-purpose"
+      }
+    ],
+    "session_crons": [
+      {
+        "id": "9ad41478",
+        "schedule": "29 13 16 11 *",
+        "recurring": false,
+        "prompt": "say the word pineapple"
+      }
+    ]
+  }
+}

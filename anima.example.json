@@ -1,0 +1,241 @@
+{
+  // Anima configuration (JSON5: comments and trailing commas are fine).
+  //
+  // Copy to ~/.anima/anima.json and edit. Anima looks for it at $ANIMA_CONFIG,
+  // else $ANIMA_HOME/.anima/anima.json (default ~/.anima/anima.json).
+  // "${VAR}" in any string is replaced with that environment variable.
+  //
+  // Running a second instance on the same machine? Give it its own ports,
+  // tmux prefix and folders: the settings and their env overrides are listed
+  // in packages/shared/src/instance.ts.
+
+  // Gateway: web UI, WebSocket and extension hub, all on one port.
+  "gateway": {
+    "port": 30086, // env ANIMA_GATEWAY_PORT overrides
+    // Bind address. Use a literal IP: "localhost" can resolve to ::1 only.
+    "host": "127.0.0.1"
+    // "token" is generated on first start and written here.
+  },
+
+  // Fallback model for the agent runtimes when a request names none.
+  "session": {
+    "model": "claude-sonnet-4-6"
+  },
+
+  // Agent host: owns every agent runtime (Claude CLI or SDK, Codex) in its own
+  // process, so sessions survive gateway and extension restarts.
+  "agentHost": {
+    // The session extension connects to ws://localhost:<port>/ws (set "url" to
+    // reach it elsewhere). Env ANIMA_AGENT_HOST_PORT overrides.
+    "port": 30087,
+    // Names this instance's tmux panes (<prefix>-claude-<id>, <prefix>-wrapper-<id>).
+    // agent-host adopts and reaps only panes with its own prefix, so a second
+    // instance on this machine needs a different one. Env ANIMA_TMUX_PREFIX overrides.
+    "tmuxPrefix": "anima",
+
+    // "cli" drives the real `claude` CLI in a tmux pane (needs tmux and a
+    // logged-in Claude Code); "sdk" runs sessions through the Agent SDK.
+    "claudeRuntime": "cli",
+    "claudeCli": {
+      // Each CLI session gets a local API proxy on a port derived from
+      // basePort (basePort .. basePort+999).
+      "basePort": 31000
+    },
+
+    // Persona every Claude session starts with: a name (looked up in
+    // ~/.anima/personas/<name>.md, then the repo's personas/), a path to a
+    // markdown file, or "none".
+    "persona": "lumen",
+    // CLI runtime: "append" keeps Claude Code's own system prompt and adds the
+    // persona after it; "replace" swaps it out.
+    "personaMode": "append",
+
+    // Close sessions idle this long, checking this often; also reap this
+    // instance's orphaned tmux panes.
+    "idleStaleMs": 7200000,
+    "reapIntervalMs": 60000,
+    "reapTmuxOrphans": true,
+
+    // Permission profiles on top of the built-ins ("yolo": bypassPermissions,
+    // "auto": Claude Code's auto mode). Keys: permissionMode, tools,
+    // allowedTools, disallowedTools, mcp ("default" | "anima-only" | "none"),
+    // mcpServers, restricted. See packages/agent-host/src/profiles.ts.
+    "sessionProfiles": {
+      // The memory summarizer (Scribe): five file tools, no shell, no MCP.
+      // With dontAsk, writes outside the Edit rules are denied (Edit rules
+      // cover Write too). Reads can't be confined, so secrets are denied.
+      // These path rules are static: they must name the folders Scribe's
+      // prompts use. If you move the memory repo (ANIMA_MEMORY_DIR) or the
+      // data dir (ANIMA_DATA_DIR), change ~/memory and ~/.anima below to match.
+      "scribe": {
+        "permissionMode": "dontAsk",
+        "tools": ["Read", "Write", "Edit", "Glob", "Grep"],
+        "allowedTools": [
+          "Read(~/memory/**)",
+          "Read(~/.anima/scribe/**)",
+          "Read(~/.anima/memory/scribe/**)",
+          "Edit(~/memory/**)",
+          "Edit(~/.anima/memory/scribe/logs/**)"
+        ],
+        "disallowedTools": [
+          // Persona files are read-only.
+          "Edit(~/memory/personas/**)",
+          "Read(~/.ssh/**)",
+          "Read(~/.aws/**)",
+          "Read(~/.anima/anima.json)",
+          "Read(~/.claude.json)",
+          "Read(**/.env)",
+          "Read(**/.env.*)"
+        ],
+        "mcp": "none"
+      }
+    }
+  },
+
+  "extensions": {
+    // Sessions and workspaces: talks to agent-host, keeps the workspace
+    // registry and session history. hot: false because it holds long-lived
+    // connections.
+    "session": {
+      "enabled": true,
+      "hot": false,
+      "config": {
+        "model": "claude-sonnet-4-6",
+        "thinking": true, // the code default is false when this is left out
+        "effort": "medium", // low | medium | high | max
+        // Profile for spawn_agent when the caller names none.
+        "spawnProfile": "auto",
+        // Workspaces kept out of the ACTIVE queue (machinery, not your work),
+        // matched case-insensitively on a workspace's name or folder. Default [].
+        // "activeQueue": { "excludeWorkspaces": ["scribe"] },
+        // Issue and PR chips under session titles. Linear tickets match only the
+        // listed prefixes (none by default, so nothing matches); "workspace" is
+        // your Linear URL slug, for links. A bare #123 resolves to the session
+        // folder's GitHub remote, else "defaultRepo", and needs at least
+        // "minDigits" digits (default 2).
+        // "refs": {
+        //   "linear": { "prefixes": ["ENG"], "workspace": "acme" },
+        //   "github": { "defaultRepo": "acme/app", "minDigits": 2 }
+        // },
+        // The next two are read by agent-host from this block, not by the
+        // session extension.
+        // SDK runtime: extra skill folders ("~/" and "/" absolute, else
+        // relative to the session's folder).
+        "skills": {
+          "paths": []
+        },
+        // SDK runtime: shrink images before they go to the API.
+        "imageProcessing": {
+          "enabled": true,
+          "maxWidth": 1600,
+          "maxHeight": 1600,
+          "maxFileSizeBytes": 1048576,
+          "format": "webp", // webp | jpeg | png
+          "quality": 85
+        }
+      }
+    },
+
+    // Web chat: workspaces, sessions and the chat UI.
+    "chat": {
+      "enabled": true,
+      "config": {}
+    },
+
+    // Memory: ingests Claude Code transcripts and has Scribe (the "scribe"
+    // profile above) summarize them into the memory repo ($ANIMA_MEMORY_DIR,
+    // default ~/memory). Times use the system timezone unless you set
+    // "timezone" (an IANA name).
+    "memory": {
+      "enabled": false,
+      "config": {
+        "watchPath": "~/.claude/projects",
+        "watch": true,
+        "conversationGapMinutes": 60,
+        "minConversationMessages": 5,
+        "processBatchSize": 10,
+        "autoProcess": false,
+        // Transcript folders never to ingest (prefixes under ~/.claude/projects,
+        // or absolute paths). Scribe's own folder is always excluded.
+        "exclude": []
+      }
+    },
+
+    // Today: the daily board at /today. Needs `gh` (logged in), `jq` and bash.
+    // Each project lists the sources it collects from; every source is optional.
+    "today": {
+      "enabled": true,
+      "config": {
+        "intervalMinutes": 5,
+        // Human gates: sessions started from the board stop and ask before
+        // each of these. Turn one off only on purpose (docs/HUMAN-IN-THE-LOOP.md).
+        "approvals": { "push": true, "merge": true, "post": true, "deploy": true },
+        // Permission profile the board's sessions run under. "yolo" makes the gates
+        // above instructions; a profile that denies push/merge/post commands makes
+        // them hard (example in docs/HUMAN-IN-THE-LOOP.md).
+        // "sessionProfile": "yolo",
+        // Optional: Linear issues assigned to you. A project collects them only
+        // when it has its own "linear" block (see the sample project) AND a key
+        // is set: here, in that block's "apiKey", or in LINEAR_API_KEY.
+        // "linear": { "apiKey": "lin_api_..." },
+        "projects": [
+          {
+            "name": "app",
+            "cwd": "/path/to/app",
+            // Review requests, your open PRs, and merges production doesn't have yet.
+            "github": { "repos": ["acme/app"], "reviews": true, "mine": true },
+            // Your Linear issues; ones labeled promiseLabel (default "Promise") go
+            // to the promise section. "apiKey" here overrides the top-level one.
+            // "linear": { "promiseLabel": "Promise" },
+            // Start each item's session in its own git worktree.
+            "worktree": { "branchPrefix": "alex/" }
+          }
+        ]
+      }
+    },
+
+    // Scheduler: one-shot, interval and cron tasks, stored in the database.
+    "scheduler": {
+      "enabled": true,
+      "config": {}
+    },
+
+    // Notify: notify.send, and the scheduler's failure alerts. Deliveries:
+    //   { "type": "log" }                                   the extension log only
+    //   { "type": "macos", "sound": "Glass" }               a macOS notification
+    //   { "type": "command", "argv": ["~/bin/notify-me"] }  your program, text on stdin
+    //   { "type": "webhook", "url": "https://ntfy.sh/…", "format": "text" }  POST it
+    "notify": {
+      "enabled": true,
+      "config": {
+        "delivery": { "type": "log" }
+        // "host": "laptop",          // how this machine names itself (default: its hostname)
+        // "dedupeWindowMs": 600000,  // identical text within this window is sent once
+      }
+    },
+
+    // Hooks: small event handlers loaded from ~/.anima/hooks and from each
+    // workspace's .anima/hooks.
+    "hooks": {
+      "enabled": true,
+      "config": {
+        "extraDirs": []
+      }
+    },
+
+    // Control: health dashboard and log viewer (/control, /logs).
+    "control": {
+      "enabled": true,
+      "config": {}
+    },
+
+    // Skills: `anima skills run|task`, plus placing skills from a skills repo
+    // into ~/.claude/skills.
+    "skills": {
+      "enabled": true,
+      "config": {
+        // "repoPath": "~/skills",  // your skills repo (one folder per skill)
+      }
+    }
+  }
+}

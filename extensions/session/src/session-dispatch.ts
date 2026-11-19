@@ -1,0 +1,720 @@
+import { animaLogFile, createLogger, formatElapsed, shortId } from "@anima/shared";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import type { ExtensionContext } from "@anima/shared";
+import { listCommands } from "./commands-discovery";
+import { listFiles } from "./file-discovery";
+import {
+  getSubagent,
+  listSubagents,
+  normalizeSubagentPurpose,
+  spawnSubagent,
+  type SubagentStatus,
+} from "./lifecycle/subagent-workflow";
+import { sendSessionNotification } from "./lifecycle/subagent-events";
+import { listSessions, getHistory, getMemoryContext } from "./lifecycle/session-query";
+import { emitGitStatus } from "./lifecycle/session-events";
+import { dropGitStatusDebounce } from "./lifecycle/git-status-debouncer";
+import { switchSession, resetSession } from "./lifecycle/session-activation";
+import { runPromptLifecycle } from "./lifecycle/prompt-lifecycle";
+import {
+  createDraftSession,
+  NEW_SESSION_PARENT,
+  startTopLevelSession,
+  type DraftSessionParams,
+  type TopLevelSessionParams,
+} from "./lifecycle/session-create";
+import { HANDOFF_EVENT_TYPE, handOffSession } from "./lifecycle/session-handoff";
+import type { AgentHostSessionInfo } from "./session-types";
+import type { HealthCheckResponse } from "@anima/shared";
+import { getRuntime } from "./runtime";
+import { backfillSessionRefs } from "./session-ref-sync";
+import { validateSessionRefs } from "./session-ref-validity";
+import { resolveRefsConfig } from "./session-reconciler";
+import {
+  getSessionProfile,
+  getStoredSession,
+  listAttentionSessions,
+  setSessionPinned,
+  resolveStaleCompleted,
+  setSessionSnooze,
+  setSessionTitle,
+  updateSessionMetadata,
+  type SessionDisposition,
+  type SessionOrigin,
+} from "./session-store";
+import { applyDisposition, emitListChanged, emitStatusChanged } from "./session-status-events";
+import { searchSessions } from "./session-search";
+import { labelSessionFolders } from "./session-folder";
+import {
+  checkWorktreeOptions,
+  createWorktree,
+  sessionFolder,
+  type WorktreeOptions,
+} from "./worktree";
+import { handoffSchema, workspaceFindSchema, workspaceUpdateSchema } from "./session-methods";
+import { startWorktreeSession } from "./lifecycle/worktree-session";
+import { worktreeSessionDeps } from "./worktree-session-deps";
+
+function expandHome(path: string): string {
+  return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
+}
+
+const log = createLogger("SessionExt:Dispatch", animaLogFile("session.log"));
+
+export type SessionMethodHandler = (
+  params: Record<string, unknown>,
+  ctx: ExtensionContext,
+) => Promise<unknown> | unknown;
+
+function getDirectories(path: string): string[] {
+  try {
+    const expandedPath = path.startsWith("~") ? join(homedir(), path.slice(1)) : path;
+    if (!existsSync(expandedPath)) return [];
+    const stat = statSync(expandedPath);
+    if (!stat.isDirectory()) return [];
+    const entries = readdirSync(expandedPath, { withFileTypes: true });
+    // Include dot-folders — many real dev workspaces live in them
+    // (~/.config/*, ~/.claude/*, etc.). Sort dot-folders
+    // after regular folders for readability.
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((a, b) => {
+        const aHidden = a.startsWith(".");
+        const bHidden = b.startsWith(".");
+        if (aHidden !== bHidden) return aHidden ? 1 : -1;
+        return a.localeCompare(b);
+      });
+  } catch (error) {
+    log.warn("Failed to read directories", { path, error: String(error) });
+    return [];
+  }
+}
+
+async function healthCheckDetailed(): Promise<HealthCheckResponse> {
+  const rt = getRuntime();
+  if (!rt.bridge.isConnected) {
+    return {
+      ok: false,
+      status: "degraded",
+      label: "Sessions",
+      metrics: [{ label: "Agent Host", value: "disconnected" }],
+      actions: [],
+      items: [],
+    };
+  }
+
+  let sessions: AgentHostSessionInfo[] = [];
+  try {
+    sessions = (await rt.bridge.listSessions()) as AgentHostSessionInfo[];
+  } catch {
+    return {
+      ok: false,
+      status: "degraded",
+      label: "Sessions",
+      metrics: [
+        { label: "Agent Host", value: "connected" },
+        { label: "Sessions", value: "unavailable" },
+      ],
+      actions: [],
+      items: [],
+    };
+  }
+
+  const visible = sessions.filter((s) => s.isProcessRunning);
+  return {
+    ok: true,
+    status: "healthy",
+    label: "Sessions",
+    metrics: [
+      { label: "Agent Host", value: "connected" },
+      { label: "Active Sessions", value: visible.filter((s) => s.isActive).length },
+      { label: "Running SDK", value: visible.length },
+      { label: "Stale", value: visible.filter((s) => s.stale).length },
+    ],
+    actions: [],
+    items: [...visible]
+      .sort((a, b) => {
+        const aTs = Date.parse(a.lastActivity || "");
+        const bTs = Date.parse(b.lastActivity || "");
+        return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0);
+      })
+      .map((s) => ({
+        id: s.id,
+        label: s.cwd || s.id,
+        status: !s.isActive ? "inactive" : s.stale ? "stale" : "healthy",
+        details: {
+          model: s.model || "unknown",
+          running: s.isProcessRunning ? "yes" : "no",
+          lastActivity: s.lastActivity || "n/a",
+          lastActivityAgo: formatElapsed(Date.now() - Date.parse(s.lastActivity)),
+        },
+      })),
+  };
+}
+
+/**
+ * Workspaces kept out of the ACTIVE queue, from `anima.json`:
+ *
+ *   "session": { "config": { "activeQueue": { "excludeWorkspaces": ["scribe"] } } }
+ *
+ * Config rather than a hardcoded list, for the same reason the Linear ref
+ * prefixes are: which workspaces are machinery is a fact about the user's
+ * setup, not about Anima. Matched case-insensitively against a workspace's
+ * name or its cwd.
+ */
+function resolveQueueExclusions(): string[] {
+  const queue = getRuntime().config?.activeQueue as { excludeWorkspaces?: unknown } | undefined;
+  const raw = queue?.excludeWorkspaces;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "");
+}
+
+/** Only a Claude session on the CLI runtime is Claude Code, which compacts an idle session. */
+function runsOnClaudeCode(agent: string | undefined): boolean {
+  return (agent ?? "claude") === "claude" && getRuntime().sessionConfig.claudeRuntime === "cli";
+}
+
+/**
+ * Whether the session's process is running, so it can compact while idle. A
+ * resolved session's process is closed after 5 quiet minutes
+ * (lifecycle/resolved-closer.ts), and a closed one never compacts.
+ */
+async function processRunning(sessionId: string): Promise<boolean> {
+  try {
+    const live = await getRuntime().bridge.listSessions();
+    return live.some((entry) => entry.id === sessionId && entry.isProcessRunning === true);
+  } catch {
+    return false;
+  }
+}
+
+export function createSessionReadHandlers(): Record<string, SessionMethodHandler> {
+  return {
+    "session.list_sessions": async (params) =>
+      listSessions(params.cwd as string, {
+        limit: params.limit as number | undefined,
+        offset: params.offset as number | undefined,
+      }),
+    "session.get_history": async (params) => {
+      const result = getHistory({
+        sessionId: params.sessionId as string,
+        cwd: params.cwd as string | undefined,
+        limit: params.limit as number | undefined,
+        before: params.before as number | undefined,
+      });
+      // Fire a fresh git-status pass async so the UI updates from cached → live
+      // even on older sessions that haven't had a turn since the cache landed.
+      // Only on the initial load: an older page shouldn't re-fetch.
+      if (params.before === undefined) {
+        void emitGitStatus(params.sessionId as string);
+      }
+      const claudeCode = runsOnClaudeCode(result.agent);
+      return {
+        ...result,
+        claudeCode,
+        idleCompaction:
+          claudeCode &&
+          params.before === undefined &&
+          (await processRunning(params.sessionId as string)),
+      };
+    },
+    "session.get_info": async (params) => {
+      const rt = getRuntime();
+      const sessionId = params.sessionId as string | undefined;
+      const activeSessions = (await rt.bridge.listSessions()) as Array<{ id: string }>;
+      if (sessionId) {
+        const session = activeSessions.find((entry) => entry.id === sessionId);
+        return { session: session || null, activeSessions };
+      }
+      return { activeSessions };
+    },
+    "session.get_subagent": async (params) => {
+      const subagent = getSubagent(params.subagentId as string);
+      return { subagent };
+    },
+    "session.list_subagents": async (params) =>
+      listSubagents({
+        parentSessionId: params.parentSessionId as string | undefined,
+        status: params.status as SubagentStatus | undefined,
+        agent: params.agent as string | undefined,
+      }),
+    "session.list_workspaces": async (params) => {
+      const rt = getRuntime();
+      return { workspaces: rt.registry.listWorkspaces({ deleted: params.deleted === true }) };
+    },
+    "session.get_workspace": async (params) => {
+      const rt = getRuntime();
+      const workspace = rt.registry.getWorkspace(params.id as string);
+      return {
+        workspace,
+        folders: workspace ? rt.registry.workspaceFolders.list(workspace.id) : [],
+      };
+    },
+    "session.get_directories": async (params) => {
+      const path = (params.path as string | undefined) || "~";
+      return { path, directories: getDirectories(path) };
+    },
+    "session.list_commands": async (params) =>
+      listCommands({ cwd: params.cwd as string | undefined }),
+    "session.list_files": async (params) => listFiles({ cwd: params.cwd as string }),
+    "session.list_attention": async (params) => ({
+      sessions: labelSessionFolders(
+        listAttentionSessions({
+          limit: params.limit as number | undefined,
+          excludeWorkspaces: resolveQueueExclusions(),
+        }),
+        { getMetadata: (sessionId) => getStoredSession(sessionId)?.metadata },
+      ),
+    }),
+    "session.health_check": async () => healthCheckDetailed(),
+    "session.get_memory_context": async (params) =>
+      getMemoryContext(params.cwd as string | undefined),
+    "session.search": async (params) =>
+      searchSessions((method, args) => getRuntime().ctx.call(method, args), {
+        query: params.query as string,
+        cwd: params.cwd as string | undefined,
+        ref: params.ref as string | undefined,
+        disposition: params.disposition as SessionDisposition[] | undefined,
+        limit: params.limit as number | undefined,
+      }),
+  };
+}
+
+export function createSessionWriteHandlers(): Record<string, SessionMethodHandler> {
+  return {
+    "session.set_title": async (params) => {
+      const sessionId = params.sessionId as string;
+      const title = params.title as string | null;
+      if (!setSessionTitle(sessionId, title)) {
+        throw new Error(`Unknown session: ${sessionId}`);
+      }
+      // A rename changes what every view of this session says, and until now
+      // it announced itself to nobody — the tab that did it patched its own
+      // copy and every other tab kept the old name until its next refetch.
+      const renamed = getStoredSession(sessionId);
+      if (renamed?.workspaceId) emitListChanged(renamed.workspaceId, "renamed");
+      log.info("Session renamed", { sessionId: sessionId.slice(0, 8), cleared: !title?.trim() });
+      return { sessionId, title: title?.trim() || null };
+    },
+    "session.set_pinned": async (params) => {
+      const sessionId = params.sessionId as string;
+      const pinned = params.pinned as boolean;
+      if (!setSessionPinned(sessionId, pinned)) {
+        throw new Error(`Unknown session: ${sessionId}`);
+      }
+      // Pinning reorders the ACTIVE pane, which refetches on list changes.
+      const session = getStoredSession(sessionId);
+      if (session?.workspaceId) emitListChanged(session.workspaceId, "pinned");
+      log.info("Session pinned", { sessionId: shortId(sessionId), pinned });
+      return { sessionId, pinned };
+    },
+    "session.resolve_stale": async (params) => {
+      const result = resolveStaleCompleted({
+        olderThanDays: (params.olderThanDays as number | undefined) ?? 5,
+        dryRun: params.dryRun as boolean | undefined,
+      });
+      if (result.resolved > 0) {
+        // One event, not one per row: the banner and the nav both just refetch,
+        // and a few thousand status events would be a self-inflicted flood.
+        for (const workspaceId of new Set(
+          result.sessions
+            .map((s) => getStoredSession(s.sessionId)?.workspaceId)
+            .filter((id): id is string => Boolean(id)),
+        )) {
+          emitListChanged(workspaceId, "disposition_changed");
+        }
+      }
+      log.info("Resolved stale sessions", {
+        matched: result.matched,
+        resolved: result.resolved,
+        dryRun: Boolean(params.dryRun),
+      });
+      return { matched: result.matched, resolved: result.resolved };
+    },
+    "session.snooze": async (params) => {
+      const sessionId = params.sessionId as string;
+      const clear = params.clear as boolean | undefined;
+      const minutes = (params.minutes as number | undefined) ?? 30;
+      const until = clear ? null : new Date(Date.now() + minutes * 60_000).toISOString();
+      if (!setSessionSnooze(sessionId, until)) {
+        throw new Error(`Unknown session: ${sessionId}`);
+      }
+      // Snoozing changes what the attention list contains, and the banner is
+      // driven by that list — so this has to announce itself, or the banner
+      // The user just silenced stays up until something else moves. Extending
+      // an existing snooze isn't a disposition change, hence the fallback.
+      if (!applyDisposition(sessionId, clear ? "open" : "snoozed")) {
+        emitStatusChanged(sessionId);
+      }
+      log.info("Session snoozed", { sessionId: shortId(sessionId), until });
+      return { sessionId, snoozedUntil: until };
+    },
+    "session.set_status": async (params) => {
+      const sessionId = params.sessionId as string;
+      const disposition = params.disposition as SessionDisposition;
+      if (!getStoredSession(sessionId)) {
+        throw new Error(`Unknown session: ${sessionId}`);
+      }
+      // A no-op returns cleanly rather than throwing: setting a session to the
+      // disposition it already has is a successful outcome, and two tabs
+      // racing on the same menu item shouldn't produce an error in one.
+      const changed = applyDisposition(sessionId, disposition);
+      return { sessionId, disposition, changed };
+    },
+    "session.backfill_refs": async (params) =>
+      backfillSessionRefs(resolveRefsConfig, {
+        days: params.days as number | undefined,
+        rescan: params.rescan as boolean | undefined,
+        dryRun: params.dryRun as boolean | undefined,
+      }),
+    "session.validate_refs": async (params) =>
+      await validateSessionRefs({
+        limit: params.limit as number | undefined,
+        revalidate: params.revalidate as boolean | undefined,
+      }),
+    "session.create_session": async (params) => {
+      // The profile defaults to yolo: sessions created directly run with full
+      // powers. Whether one is the user's is `origin`, which the user's
+      // clients send; anything else defaults to automated in createDraftSession.
+      const profile = (params.profile as string | undefined) ?? "yolo";
+      const options = params as WorktreeOptions;
+      if (options.worktree) {
+        // Answer now; the worktree is made in the background (worktree-session.ts).
+        const draft = params as unknown as DraftSessionParams;
+        return startWorktreeSession(
+          {
+            folder: params.cwd as string,
+            branch: options.worktree,
+            base: options.worktreeBase,
+            profile,
+            title: params.title as string | undefined,
+          },
+          worktreeSessionDeps((cwd, metadata) =>
+            createDraftSession({ ...draft, cwd, profile, metadata }),
+          ),
+        );
+      }
+      const cwd = (await sessionFolder(options, params.cwd as string, profile)) as string;
+      const { sessionId, workspaceId } = createDraftSession({
+        ...(params as unknown as DraftSessionParams),
+        cwd,
+        profile,
+      });
+      // Stored before anything awaits, so no list refresh sees the session
+      // without its name.
+      const title = (params.title as string | undefined)?.trim() || null;
+      if (title) setSessionTitle(sessionId, title);
+      return { sessionId, workspaceId, cwd, title };
+    },
+    "session.send_prompt": async (params) => {
+      const rt = getRuntime();
+      return await runPromptLifecycle(
+        {
+          sessionId: params.sessionId as string,
+          content: params.content as string | unknown[],
+          cwd: params.cwd as string | undefined,
+          model: params.model as string | undefined,
+          agent: (params.agent as string | undefined) || "claude",
+          streaming: params.streaming !== false,
+          source: params.source as string | undefined,
+        },
+        {
+          connectionId: rt.ctx.connectionId,
+          tags: rt.ctx.tags,
+        },
+      );
+    },
+    "session.interrupt_session": async (params) => {
+      const rt = getRuntime();
+      log.info("Interrupting session", { sessionId: shortId(params.sessionId as string) });
+      const ok = await rt.bridge.interruptSession(params.sessionId as string);
+      return { ok };
+    },
+    "session.answer_modal": async (params) => {
+      const rt = getRuntime();
+      const sessionId = params.sessionId as string;
+      log.info("Answering modal prompt", { sessionId: shortId(sessionId), key: params.key });
+      const result = await rt.bridge.answerModal(
+        sessionId,
+        params.key as string,
+        params.fingerprint as string | undefined,
+      );
+      if (!result.ok) throw new Error(result.error ?? "Failed to answer prompt");
+      return { ok: true };
+    },
+    "session.close_session": async (params) => {
+      const rt = getRuntime();
+      log.info("Closing session", { sessionId: shortId(params.sessionId as string) });
+      await rt.bridge.closeSession(params.sessionId as string);
+      rt.sessionActors.clearSession(params.sessionId as string);
+      rt.registry.archiveSession(params.sessionId as string);
+      dropGitStatusDebounce(params.sessionId as string);
+      log.info("Session closed", { sessionId: shortId(params.sessionId as string) });
+      return { ok: true };
+    },
+    "session.switch_session": async (params) =>
+      switchSession({
+        sessionId: params.sessionId as string,
+        cwd: params.cwd as string,
+        model: params.model as string | undefined,
+      }),
+    "session.reset_session": async (params) =>
+      resetSession({
+        cwd: params.cwd as string,
+        model: params.model as string | undefined,
+      }),
+    "session.set_permission_mode": async (params) => {
+      const rt = getRuntime();
+      log.info("Setting permission mode", {
+        sessionId: shortId(params.sessionId as string),
+        mode: params.mode,
+      });
+      const ok = await rt.bridge.setPermissionMode(
+        params.sessionId as string,
+        params.mode as string,
+      );
+      return { ok };
+    },
+    "session.send_tool_result": async (params) => {
+      const rt = getRuntime();
+      log.info("Sending tool result", {
+        sessionId: shortId(params.sessionId as string),
+        toolUseId: params.toolUseId,
+        isError: params.isError,
+      });
+      const ok = await rt.bridge.sendToolResult(
+        params.sessionId as string,
+        params.toolUseId as string,
+        params.content as string,
+        params.isError as boolean,
+      );
+      return { ok };
+    },
+    "session.spawn_agent": async (params) => {
+      const rt = getRuntime();
+      const request = { connectionId: rt.ctx.connectionId, tags: rt.ctx.tags };
+      const name = params.name as string | undefined;
+      const profile = (params.profile as string | undefined) ?? rt.sessionConfig.spawnProfile;
+
+      if (params.parentSessionId === NEW_SESSION_PARENT) {
+        const cwd = await sessionFolder(
+          params as WorktreeOptions,
+          params.cwd as string | undefined,
+          profile,
+        );
+        const topLevel = { ...params, cwd, profile } as unknown as TopLevelSessionParams;
+        return await startTopLevelSession(topLevel, {
+          defaultProfile: rt.sessionConfig.spawnProfile,
+          createDraft: createDraftSession,
+          setTitle: (sessionId, title) => {
+            setSessionTitle(sessionId, title);
+          },
+          sendPrompt: (prompt) => runPromptLifecycle({ ...prompt, streaming: true }, request),
+        });
+      }
+
+      // A child's worktree branches from the repo it names, else its parent's.
+      checkWorktreeOptions(params as WorktreeOptions);
+      const parentWorkspaceId = getStoredSession(params.parentSessionId as string)?.workspaceId;
+      const repoFolder =
+        (params.cwd as string | undefined) ??
+        (parentWorkspaceId ? rt.registry.getWorkspace(parentWorkspaceId)?.cwd : undefined);
+      const cwd = params.worktree
+        ? await sessionFolder(params as WorktreeOptions, repoFolder, profile)
+        : (params.cwd as string | undefined);
+
+      const spawned = await spawnSubagent(
+        {
+          parentSessionId: params.parentSessionId as string,
+          agent: params.agent as string | undefined,
+          prompt: params.prompt as string,
+          purpose: normalizeSubagentPurpose(params.purpose as string | undefined),
+          cwd,
+          model: params.model as string | undefined,
+          systemPrompt: params.systemPrompt as string | undefined,
+          thinking: params.thinking as boolean | undefined,
+          effort: params.effort as string | undefined,
+          sandbox: params.sandbox as "read-only" | "workspace-write" | "danger-full-access",
+          metadata: params.metadata as Record<string, unknown> | undefined,
+          profile,
+          origin: params.origin as SessionOrigin | undefined,
+        },
+        request,
+      );
+      const title = name?.trim() || null;
+      if (title) setSessionTitle(spawned.sessionId as string, title);
+      return { ...spawned, title };
+    },
+    "session.handoff": async (params) => {
+      const rt = getRuntime();
+      const request = { connectionId: rt.ctx.connectionId, tags: rt.ctx.tags };
+      const result = await handOffSession(handoffSchema.parse(params), {
+        getSession: getStoredSession,
+        getWorkspaceCwd: (workspaceId) => rt.registry.getWorkspace(workspaceId)?.cwd ?? null,
+        getProfile: getSessionProfile,
+        readFile: (path) => readFileSync(path, "utf8"),
+        createDraft: createDraftSession,
+        setTitle: (sessionId, title) => {
+          setSessionTitle(sessionId, title);
+        },
+        sendPrompt: (prompt) => runPromptLifecycle({ ...prompt, streaming: true }, request),
+        markHandedOff: (sessionId, targetSessionId) => {
+          updateSessionMetadata(sessionId, {
+            handedOffTo: targetSessionId,
+            handedOffAt: new Date().toISOString(),
+          });
+          applyDisposition(sessionId, "resolved");
+        },
+        // Broadcast on the caller's own stream: the only clients subscribed to
+        // it are the ones showing it, so a handoff from a background session
+        // moves nobody who is reading something else.
+        announce: (payload) => {
+          rt.ctx.emit(`session.${payload.sessionId}.${HANDOFF_EVENT_TYPE}`, payload);
+        },
+        createWorktree,
+      });
+      log.info("Session handed off", {
+        from: shortId(result.previousSessionId),
+        to: shortId(result.sessionId),
+        title: result.title,
+      });
+      return result;
+    },
+    "session.interrupt_subagent": async (params) => {
+      const rt = getRuntime();
+      const subagentId = params.subagentId as string;
+      const ok = await rt.bridge.interruptSession(subagentId);
+      return { ok, subagentId };
+    },
+    "session.send_notification": async (params) => {
+      const rt = getRuntime();
+      const sessionId = params.sessionId as string;
+      const text = params.text as string;
+
+      log.info("Sending notification", {
+        sessionId: shortId(sessionId),
+        content: { kind: "text", chars: text.length },
+      });
+
+      await sendSessionNotification(sessionId, text, {
+        connectionId: rt.ctx.connectionId,
+        tags: rt.ctx.tags,
+      });
+
+      return { ok: true, sessionId };
+    },
+    "session.get_or_create_workspace": async (params) => {
+      const rt = getRuntime();
+      const cwd = params.cwd as string;
+      const result = rt.registry.getOrCreateWorkspace(
+        cwd,
+        params.name as string | undefined,
+        params.general as boolean | undefined,
+        // The explicit "use this folder" call, so it brings a deleted
+        // workspace back. Internal callers never do.
+        { restore: true },
+      );
+      log.info("Get/create workspace", {
+        cwd,
+        created: result.created,
+        restored: Boolean(result.restored),
+        general: result.workspace.general,
+      });
+      return result;
+    },
+    "session.delete_workspace": async (params) => {
+      const rt = getRuntime();
+      // The id wins: the CLI fills `cwd` from the shell, so a bare cwd can name
+      // whatever folder the caller happens to be standing in.
+      const id = params.id as string | undefined;
+      const target = id ? rt.registry.getWorkspace(id) : null;
+      if (id && !target) throw new Error(`Unknown workspace: ${id}`);
+      const root = target?.cwd ?? expandHome(params.cwd as string);
+      const deleted = rt.registry.deleteWorkspace(root);
+      const workspace = target ?? rt.registry.getWorkspaceByCwd(root);
+      return {
+        deleted,
+        workspace: workspace
+          ? { id: workspace.id, name: workspace.name, cwd: workspace.cwd }
+          : null,
+      };
+    },
+    "session.update_workspace": async (params) => {
+      const rt = getRuntime();
+      const p = workspaceUpdateSchema.parse(params);
+      const workspace = p.id
+        ? rt.registry.getWorkspace(p.id)
+        : rt.registry.getWorkspaceByCwd(expandHome(p.cwd as string));
+      if (!workspace) throw new Error(`Unknown workspace: ${p.id ?? p.cwd}`);
+      const {
+        id: _id,
+        cwd: _cwd,
+        detect,
+        addFolder,
+        removeFolder,
+        setRoot,
+        moveFolder,
+        merge,
+        ...fields
+      } = p;
+
+      const notes: string[] = [];
+      const folderOps = rt.registry.workspaceFolders;
+      const toAdd = addFolder === undefined ? [] : [addFolder].flat();
+      for (const path of toAdd) notes.push(...folderOps.add(workspace.id, path, { merge }).notes);
+      if (moveFolder) {
+        notes.push(
+          ...folderOps.move(workspace.id, moveFolder.from, moveFolder.to, { merge }).notes,
+        );
+      }
+      if (setRoot) notes.push(...folderOps.setRoot(workspace.id, setRoot).notes);
+      if (removeFolder) notes.push(...folderOps.remove(workspace.id, removeFolder).notes);
+
+      // A moved or re-rooted workspace has a new cwd for detection.
+      const current = rt.registry.getWorkspace(workspace.id) ?? workspace;
+      if (detect && fields.githubRepo === undefined) {
+        const detected = rt.registry.detectGithubRepo(current.cwd);
+        if (detected) fields.githubRepo = detected;
+      }
+      return {
+        workspace: rt.registry.updateWorkspaceProject(workspace.id, fields),
+        folders: folderOps.list(workspace.id),
+        notes,
+      };
+    },
+    "session.find_workspace": async (params) => {
+      const rt = getRuntime();
+      return { workspace: rt.registry.findWorkspace(workspaceFindSchema.parse(params)) };
+    },
+    "session.set_workspace_pinned": async (params) => {
+      const rt = getRuntime();
+      const workspace = rt.registry.setWorkspacePinned(
+        params.id as string,
+        params.pinned as boolean,
+      );
+      return { workspace };
+    },
+  };
+}
+
+export function createSessionMethodHandlers(): Record<string, SessionMethodHandler> {
+  return {
+    ...createSessionReadHandlers(),
+    ...createSessionWriteHandlers(),
+  };
+}
+
+export async function dispatchMethod(
+  method: string,
+  params: Record<string, unknown>,
+  ctx: ExtensionContext,
+): Promise<unknown> {
+  const handler = createSessionMethodHandlers()[method];
+  if (!handler) {
+    throw new Error(`Unknown method: ${method}`);
+  }
+  return await handler(params, ctx);
+}

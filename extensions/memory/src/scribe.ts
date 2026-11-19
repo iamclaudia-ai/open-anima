@@ -1,0 +1,1064 @@
+/**
+ * Scribe — the memory summarizer
+ *
+ * Processes conversations through a queue-based background worker.
+ * Conversations are marked "queued" by memory.process, then the worker
+ * picks them up one at a time: queued → processing → archived.
+ *
+ * Scribe uses tools (Read, Write, Edit, Glob, Grep) to write memories directly
+ * to the memory repo (memoryRoot(): ANIMA_MEMORY_DIR, default ~/memory) — no
+ * JSON extraction, no memory-writer intermediary. Its sessions run under the
+ * `scribe` profile (agentHost.sessionProfiles): just those five tools, no
+ * shell, no MCP servers, writes confined to the memory repo and its log
+ * folder. The profile's path rules are static config, so they must name the
+ * same folders the prompts do.
+ * After each conversation, episode ordering is verified and changes
+ * are committed to git.
+ *
+ * Uses a dedicated workspace at scribeCwd() (<data dir>/scribe) for Scribe's sessions.
+ * Each conversation gets a fresh Claude session so:
+ * - JSONL history stays bounded per transcript
+ * - prior transcripts do not leak into the next run's context
+ * - the only long-lived identity is the in-flight session ID recorded on
+ *   the conversation row for crash recovery
+ *
+ * The worker sleeps when idle and can be woken via AbortController
+ * when new conversations are queued. Survives crashes by best-effort
+ * recovery of in-flight sessions before falling back to requeueing work.
+ */
+
+import { readFileSync, existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { truncatePreservingSurrogates, withTimeout, type ExtensionContext } from "@anima/shared";
+import {
+  getNextQueued,
+  getQueuedCount,
+  getEntriesForConversation,
+  getProcessingConversations,
+  resetConversationToQueued,
+  updateConversationStatus,
+  updateConversationProcessed,
+  getPreviousConversationContext,
+  type ConversationRow,
+} from "./db";
+import { formatTranscript } from "./transcript-formatter";
+import {
+  ensureScribeDirs,
+  memoryRoot,
+  scribeCwd,
+  scribeLogsDir,
+  scribeTranscriptsDir,
+} from "./paths";
+
+// ============================================================================
+// System Prompt (template loaded once; paths filled in when it is used)
+// ============================================================================
+
+const SYSTEM_PROMPT_TEMPLATE = readFileSync(
+  join(import.meta.dir, "prompts", "scribe-system.md"),
+  "utf-8",
+);
+
+/**
+ * Scribe's system prompt with this instance's real folders in place of
+ * {{MEMORY_DIR}} and {{SCRIBE_LOGS_DIR}}: the memory repo (ANIMA_MEMORY_DIR)
+ * and its reasoning logs under the data dir (ANIMA_DATA_DIR). Resolved per
+ * call, so a second instance's Scribe never writes the default ~/memory.
+ */
+export function scribeSystemPrompt(): string {
+  return SYSTEM_PROMPT_TEMPLATE.replaceAll("{{MEMORY_DIR}}", memoryRoot()).replaceAll(
+    "{{SCRIBE_LOGS_DIR}}",
+    scribeLogsDir(),
+  );
+}
+
+// Cache the episode-path Intl.DateTimeFormat per timezone. Constructing a
+// formatter lazily compiles locale data on every call; caching one per timezone
+// keeps `computeEpisodePath` allocation-free on the hot ingest path.
+const episodePathFormatters = new Map<string, Intl.DateTimeFormat>();
+function getEpisodePathFormatter(timezone: string): Intl.DateTimeFormat {
+  let f = episodePathFormatters.get(timezone);
+  if (!f) {
+    // Module-scope cache keyed by timezone — linter still flags the literal.
+    // react-doctor-disable-next-line react-doctor/js-hoist-intl
+    f = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    episodePathFormatters.set(timezone, f);
+  }
+  return f;
+}
+
+/**
+ * Compute the episode file path for a conversation.
+ * Format: episodes/YYYY-MM/YYYY-MM-DD-HHMM-{convId}.md
+ *
+ * Uses the first entry's timestamp converted to local time for the date/time components.
+ */
+function computeEpisodePath(firstTimestamp: string, convId: number, timezone: string): string {
+  const d = new Date(firstTimestamp);
+  const parts = getEpisodePathFormatter(timezone).formatToParts(d);
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "00";
+  const year = get("year");
+  const month = get("month");
+  const day = get("day");
+  const hour = get("hour");
+  const minute = get("minute");
+
+  return `episodes/${year}-${month}/${year}-${month}-${day}-${hour}${minute}-${convId}.md`;
+}
+
+/** Scribe's "ready" handshake takes seconds; anything near this is a hang. */
+const INIT_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** Session profile Scribe runs under; defined in agentHost.sessionProfiles. */
+const SCRIBE_PROFILE = "scribe";
+
+/** How far back `open()` looks for sessions a previous worker stranded. */
+const ORPHAN_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+/** Transcript attempts before a conversation is parked for review. */
+export const MAX_CONVERSATION_ATTEMPTS = 3;
+
+/** Worker backoff after a failure: 5s, doubling, capped at 30 minutes. */
+const BACKOFF_BASE_MS = 5_000;
+const BACKOFF_MAX_MS = 30 * 60 * 1000;
+
+export function backoffDelayMs(consecutiveFailures: number): number {
+  const exponent = Math.max(0, consecutiveFailures - 1);
+  return Math.min(BACKOFF_BASE_MS * 2 ** exponent, BACKOFF_MAX_MS);
+}
+
+/**
+ * Scribe itself couldn't start — the system prompt failed, so this says
+ * nothing about the conversation waiting to be processed. Kept distinct so a
+ * broken Scribe backs off globally instead of parking the whole queue.
+ */
+export class ScribeOpenError extends Error {
+  override name = "ScribeOpenError";
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface ScribeConfig {
+  model: string;
+  timezone: string;
+  minConversationMessages: number;
+}
+
+export interface RepoSyncRequester {
+  requestSync(reason?: string): void;
+}
+
+interface SessionHistoryBlock {
+  type: "text" | "thinking" | "image" | "file" | "tool_use";
+  content?: string;
+}
+
+interface SessionHistoryMessage {
+  role: "user" | "assistant" | "compaction_boundary";
+  blocks: SessionHistoryBlock[];
+}
+
+interface SessionRuntimeInfo {
+  id: string;
+  isActive: boolean;
+  isProcessRunning: boolean;
+}
+
+// ============================================================================
+// Scribe Session (RPC via ctx.call)
+// ============================================================================
+
+/**
+ * A per-conversation session for Scribe's processing.
+ *
+ * Uses ctx.call() RPC to communicate with the gateway — proper
+ * request/response instead of fire-and-forget WebSocket messages.
+ * Creates one session for one transcript.
+ * The system prompt is sent as the first message to establish Scribe's identity.
+ */
+export class ScribeSession {
+  private _sessionId: string | null = null;
+  private initialized = false;
+  promptCount = 0;
+
+  constructor(
+    private ctx: ExtensionContext,
+    private model: string,
+    private log: (level: string, msg: string) => void,
+  ) {}
+
+  get isOpen(): boolean {
+    return this.initialized && this._sessionId !== null;
+  }
+
+  /** The Claude Code session ID for this Scribe session */
+  get sessionId(): string | null {
+    return this._sessionId;
+  }
+
+  /**
+   * Create workspace + session, send system prompt.
+   * Cleans up any orphaned sessions from previous runs first.
+   */
+  async open(): Promise<void> {
+    await this.close(); // Clean up any existing session we know about
+
+    // Get or create Scribe's workspace
+    ensureScribeDirs();
+    await this.ctx.call("session.get_or_create_workspace", { cwd: scribeCwd() });
+
+    await this.closeOrphanedSessions();
+
+    // `create_session` only drafts a DB row — the CLI pane isn't spawned until
+    // the first prompt, so from here on we always hold the id of anything that
+    // could leak.
+    const result = (await this.ctx.call("session.create_session", {
+      cwd: scribeCwd(),
+      model: this.model,
+      profile: SCRIBE_PROFILE,
+    })) as {
+      sessionId: string;
+    };
+    this._sessionId = result.sessionId;
+    if (!this._sessionId) throw new Error("Failed to create session");
+
+    // Send system prompt as first message
+    const initPrompt = `${scribeSystemPrompt()}\n\n---\n\nYou are now ready to process conversation transcripts. For each transcript I send, use your tools to write memories to ${memoryRoot()}/, then respond with a SUMMARY or SKIP line.\n\nRespond with "ready" to confirm you understand.`;
+
+    try {
+      const initResult = (await withTimeout(
+        this.ctx.call("session.send_prompt", {
+          sessionId: this._sessionId,
+          content: initPrompt,
+          streaming: false,
+        }),
+        INIT_TIMEOUT_MS,
+        "Scribe system prompt",
+      )) as { text: string; stopReason?: string };
+
+      if (!initResult.text) {
+        const reason = initResult.stopReason || "unknown";
+        throw new Error(
+          `System prompt got no response (stop_reason: ${reason}). ` +
+            `Check API credentials and model availability.`,
+        );
+      }
+    } catch (error) {
+      // A failed init must not strand its CLI pane — every retry would leave
+      // one more behind.
+      await this.close();
+      throw new ScribeOpenError(error instanceof Error ? error.message : String(error));
+    }
+
+    this.initialized = true;
+    this.promptCount = 0;
+  }
+
+  /**
+   * Close Scribe sessions a previous worker left behind (crash, restart, HMR
+   * mid-open). Bounded to recent sessions: `list_sessions` returns every
+   * transcript ever written in ~/.anima/scribe, and anything older than the window
+   * has long since been reaped by agent-host's idle reaper.
+   */
+  private async closeOrphanedSessions(): Promise<void> {
+    let sessions: Array<{ sessionId: string; modified?: string }>;
+    try {
+      const listed = (await this.ctx.call("session.list_sessions", { cwd: scribeCwd() })) as {
+        sessions?: Array<{ sessionId: string; modified?: string }>;
+      };
+      sessions = listed?.sessions ?? [];
+    } catch {
+      return; // workspace may not exist yet
+    }
+
+    const cutoff = Date.now() - ORPHAN_WINDOW_MS;
+    for (const s of sessions) {
+      const modified = s.modified ? Date.parse(s.modified) : Number.NaN;
+      if (!s.sessionId || !(modified >= cutoff)) continue;
+      try {
+        await this.ctx.call("session.close_session", { sessionId: s.sessionId });
+      } catch {
+        // Already closed or gone
+      }
+    }
+  }
+
+  /**
+   * Send a transcript for processing and return Scribe's response.
+   *
+   * Scribe uses tools (Read/Write/Edit) to write memories directly,
+   * then responds with SUMMARY or SKIP. The runtime handles tool
+   * execution automatically via bypassPermissions.
+   *
+   * Fresh session per conversation — no compaction overhead.
+   * Previous context is injected via DB-backed summaries.
+   */
+  async processTranscript(content: string): Promise<string> {
+    if (!this._sessionId || !this.initialized) {
+      throw new Error("Session not initialized");
+    }
+
+    this.promptCount++;
+
+    const result = (await Promise.race([
+      this.ctx.call("session.send_prompt", {
+        sessionId: this._sessionId,
+        content,
+        streaming: false,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(new Error(`processTranscript timed out after ${PROCESS_TIMEOUT_MS / 1000}s`)),
+          PROCESS_TIMEOUT_MS,
+        ),
+      ),
+    ])) as { text: string; stopReason?: string };
+
+    const text = result.text;
+    if (!text) {
+      const reason = result.stopReason || "unknown";
+      throw new Error(
+        `No text in prompt response (stop_reason: ${reason}). ` +
+          `This may indicate expired credentials, an API error, or the model responded with only tool calls.`,
+      );
+    }
+    return text;
+  }
+
+  /**
+   * Close the session — release the runtime resources via gateway RPC.
+   */
+  async close(): Promise<void> {
+    if (this._sessionId) {
+      try {
+        await this.ctx.call("session.close_session", { sessionId: this._sessionId });
+      } catch {
+        // Session may already be closed
+      }
+    }
+    this._sessionId = null;
+    this.initialized = false;
+    this.promptCount = 0;
+  }
+}
+
+// ============================================================================
+// Background Worker
+// ============================================================================
+
+/** How long the worker sleeps when no queued conversations are found */
+const WORKER_SLEEP_MS = 30_000;
+
+/** Maximum time to wait for a single processTranscript call (10 minutes) */
+const PROCESS_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Background worker that processes queued conversations one at a time.
+ *
+ * Loop: get next queued → mark processing → send to Scribe → verify → git commit → mark archived → repeat.
+ * Sleeps when idle. Can be woken via wake() when new items are queued.
+ * Session is reused across all conversations — auto-compaction handles context limits.
+ */
+export class ScribeWorker {
+  private running = false;
+  private loopPromise: Promise<void> | null = null;
+  private sleepAbort: AbortController | null = null;
+  private session: ScribeSession | null = null;
+  /** Failed transcript attempts per conversation (open failures don't count). */
+  private conversationFailures = new Map<number, number>();
+  /** Failures in a row, any cause — drives the loop's backoff. */
+  private consecutiveFailures = 0;
+
+  constructor(
+    private config: ScribeConfig,
+    private ctx: ExtensionContext | null,
+    private log: (level: string, msg: string) => void,
+    private repoSync: RepoSyncRequester | null = null,
+  ) {}
+
+  /**
+   * Start the background processing loop.
+   */
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.log("INFO", "Scribe: Worker started");
+    this.loopPromise = this.loop();
+  }
+
+  /**
+   * Stop the worker and wait for the current loop iteration to finish.
+   * This prevents overlapping workers when the extension hot-reloads.
+   */
+  async stop(): Promise<void> {
+    this.running = false;
+    this.sleepAbort?.abort();
+    // Wait for the loop to finish its current iteration
+    if (this.loopPromise) {
+      await this.loopPromise;
+      this.loopPromise = null;
+    }
+    if (this.session) {
+      await this.session.close();
+      this.session = null;
+    }
+    this.log("INFO", "Scribe: Worker stopped");
+  }
+
+  /**
+   * Wake the worker from sleep to check for new queued items.
+   * Called when memory.process queues new conversations.
+   */
+  wake(): void {
+    // New work is no reason to cut a failure backoff short — that would turn
+    // it back into a retry every time a transcript is queued. stop() still
+    // aborts the sleep directly.
+    if (this.consecutiveFailures > 0) return;
+    this.sleepAbort?.abort();
+  }
+
+  /**
+   * Main processing loop — runs until stop() is called.
+   */
+  private async loop(): Promise<void> {
+    while (this.running) {
+      try {
+        // Safety: if something is already processing (e.g. zombie from a crashed worker),
+        // don't start another one until we reconcile the in-flight work.
+        const alreadyProcessing = getProcessingConversations();
+        if (alreadyProcessing.length > 0) {
+          const handled = await this.reconcileProcessingConversations(alreadyProcessing);
+          if (!handled) {
+            this.log(
+              "INFO",
+              `Scribe: Waiting — ${alreadyProcessing.length} conversation(s) already processing`,
+            );
+            await this.sleep(WORKER_SLEEP_MS);
+          }
+          continue;
+        }
+
+        const conv = getNextQueued();
+
+        if (conv) {
+          await this.processOne(conv);
+        } else {
+          await this.sleep(WORKER_SLEEP_MS);
+        }
+        this.consecutiveFailures = 0;
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.consecutiveFailures += 1;
+        const delayMs = backoffDelayMs(this.consecutiveFailures);
+        this.log(
+          "ERROR",
+          `Scribe: Worker loop error (${this.consecutiveFailures} in a row, retrying in ${Math.round(delayMs / 1000)}s): ${msg}`,
+        );
+        await this.sleep(delayMs);
+      }
+    }
+  }
+
+  private async reconcileProcessingConversations(
+    processing: Array<{ id: number; sessionId: string | null }>,
+  ): Promise<boolean> {
+    if (!this.ctx) return false;
+
+    let handled = false;
+    for (const conv of processing) {
+      if (!conv.sessionId) {
+        resetConversationToQueued(conv.id);
+        this.log("WARN", `Scribe: Reset conversation ${conv.id} — missing recovery session ID`);
+        handled = true;
+        continue;
+      }
+
+      const session = await this.getScribeSessionInfo(conv.sessionId);
+      if (session?.isProcessRunning) continue;
+
+      const rawResponse = await recoverScribeResponse(this.ctx, conv.sessionId);
+      if (rawResponse) {
+        this.log("INFO", `Scribe: Recovered completed response for conversation ${conv.id}`);
+        await finalizeScribeConversation(
+          conv.id,
+          rawResponse,
+          getQueuedCount(),
+          this.log,
+          this.repoSync ?? undefined,
+          this.ctx,
+        );
+      } else {
+        resetConversationToQueued(conv.id);
+        this.log(
+          "WARN",
+          `Scribe: Requeued conversation ${conv.id} — no recoverable response for session ${conv.sessionId}`,
+        );
+      }
+
+      try {
+        await this.ctx.call("session.close_session", { sessionId: conv.sessionId });
+      } catch {
+        // Session may already be closed or absent in agent-host.
+      }
+
+      handled = true;
+    }
+
+    return handled;
+  }
+
+  private async getScribeSessionInfo(sessionId: string): Promise<SessionRuntimeInfo | null> {
+    if (!this.ctx) return null;
+    try {
+      const info = (await this.ctx.call("session.get_info", { sessionId })) as {
+        session?: SessionRuntimeInfo | null;
+      };
+      return info.session || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Process a single conversation through Scribe's tool-based pipeline.
+   */
+  private async processOne(conv: ConversationRow): Promise<void> {
+    const queuedRemaining = getQueuedCount();
+
+    // Skip if below minimum message count
+    if (conv.entryCount < this.config.minConversationMessages) {
+      updateConversationProcessed(conv.id, "skipped", "Below minimum message count");
+      this.log(
+        "INFO",
+        `Scribe: Skipped conversation ${conv.id} (${conv.entryCount} < ${this.config.minConversationMessages} min messages) [${queuedRemaining - 1} queued]`,
+      );
+      return;
+    }
+
+    // Get entries and format transcript
+    const entries = getEntriesForConversation(conv.id);
+    if (entries.length === 0) {
+      updateConversationProcessed(conv.id, "skipped", "No entries found");
+      this.log(
+        "INFO",
+        `Scribe: Skipped conversation ${conv.id} (no entries) [${queuedRemaining - 1} queued]`,
+      );
+      return;
+    }
+
+    const transcript = formatTranscript(conv, entries, this.config.timezone);
+    const transcriptKB = (transcript.text.length / 1024).toFixed(1);
+
+    // Skip transcripts that would blow the context window (~140K usable tokens)
+    const MAX_TRANSCRIPT_KB = 100;
+    if (transcript.text.length / 1024 > MAX_TRANSCRIPT_KB) {
+      updateConversationProcessed(
+        conv.id,
+        "skipped",
+        `Transcript too large (${transcriptKB}KB > ${MAX_TRANSCRIPT_KB}KB)`,
+      );
+      this.log(
+        "INFO",
+        `Scribe: Skipped conversation ${conv.id} (${transcriptKB}KB > ${MAX_TRANSCRIPT_KB}KB limit) [${queuedRemaining - 1} queued]`,
+      );
+      return;
+    }
+
+    // Pre-compute episode file path: <memory dir>/episodes/YYYY-MM/YYYY-MM-DD-HHMM-{convId}.md
+    const episodePath = computeEpisodePath(entries[0].timestamp, conv.id, this.config.timezone);
+
+    // Skip if episode file already exists (duplicate processing guard)
+    if (existsSync(join(memoryRoot(), episodePath))) {
+      updateConversationProcessed(
+        conv.id,
+        "skipped",
+        `Episode file already exists: ${episodePath}`,
+      );
+      this.log(
+        "INFO",
+        `Scribe: Skipped conversation ${conv.id} — episode file already exists: ${episodePath} [${queuedRemaining - 1} queued]`,
+      );
+      return;
+    }
+
+    this.log(
+      "INFO",
+      `Scribe: [${conv.id}] ${transcript.date} ${transcript.timeRange} — ${entries.length} entries, ${transcriptKB}KB transcript [${queuedRemaining - 1} queued]`,
+    );
+
+    // Fresh session per conversation — no compaction overhead. Everything from
+    // open() on runs inside one try/finally: a session that was opened, or
+    // half-opened, is always closed, whatever fails.
+    if (!this.ctx) throw new Error("Scribe: No extension context — cannot create session");
+    const session = new ScribeSession(this.ctx, this.config.model, this.log);
+    this.session = session;
+
+    try {
+      this.log("INFO", "Scribe: Opening session...");
+      await session.open();
+      this.log("INFO", "Scribe: Session ready");
+
+      // Mark as processing with metadata (include sessionId for recovery checks)
+      updateConversationStatus(conv.id, "processing", {
+        transcriptKB: Number(transcriptKB),
+        entries: entries.length,
+        date: transcript.date,
+        timeRange: transcript.timeRange,
+        cwd: transcript.primaryCwd,
+        sessionId: session.sessionId,
+      });
+
+      // Look up previous conversations from same source for context
+      const previousContext = getPreviousConversationContext(conv.sourceFile, conv.firstMessageAt);
+
+      let contextBlock = "";
+      if (previousContext.length > 0) {
+        const ctxEntries = previousContext.map((pc) => {
+          const files =
+            pc.filesWritten.length > 0
+              ? `\nFiles written: ${pc.filesWritten.map((f) => f.replace(memoryRoot() + "/", "")).join(", ")}`
+              : "";
+          return `- [${pc.date}] ${pc.summary || "(no summary)"}${files}`;
+        });
+        contextBlock = `\n## Context from Previous Conversations\n\nThese are summaries and files from the conversations immediately before this one in the same session. Use them to resolve ambiguous references like "this", "it", or "what we discussed".\n\n${ctxEntries.join("\n")}\n\n`;
+      }
+
+      // Write the transcript to disk and reference it by path — pasting 30KB+
+      // through tmux bracketed-paste is unreliable (Claude's TUI silently drops
+      // very large pastes), and Scribe has a Read tool anyway. The session's
+      // cwd is scribeCwd() (<data dir>/scribe), so the relative path resolves cleanly.
+      const transcriptPath = join(scribeTranscriptsDir(), `${conv.id}.md`);
+      try {
+        await Bun.write(transcriptPath, transcript.text);
+      } catch (err) {
+        throw new Error(
+          `Failed to write transcript file ${transcriptPath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      const prompt = `${contextBlock}Process the conversation transcript at transcripts/${conv.id}.md (conversation ID: ${conv.id}). Use your Read tool to load it.
+
+Episode file: ${join(memoryRoot(), episodePath)}
+
+FIRST write your reasoning log to ${scribeLogsDir()}/${conv.id}.md, THEN write the episode to the path above and any other memories to ${memoryRoot()}/, then Edit the log to add its Results, then respond with SUMMARY or SKIP. Your tools are Read, Write, Edit, Glob and Grep; Write creates folders, and there is no shell.`;
+
+      this.log(
+        "INFO",
+        `Scribe: [${conv.id}] Sending ${(prompt.length / 1024).toFixed(1)}KB prompt (session prompt #${session.promptCount + 1})`,
+      );
+
+      // Send transcript — Scribe uses tools to write files, then responds with SUMMARY/SKIP
+      const startTime = Date.now();
+      const rawResponse = await session.processTranscript(prompt);
+      await finalizeScribeConversation(
+        conv.id,
+        rawResponse,
+        queuedRemaining,
+        this.log,
+        this.repoSync ?? undefined,
+        this.ctx,
+        startTime,
+      );
+      this.conversationFailures.delete(conv.id);
+    } catch (error) {
+      this.recordConversationFailure(conv.id, error);
+      // Rethrow so the loop backs off instead of retrying immediately.
+      throw error;
+    } finally {
+      await session.close();
+      this.session = null;
+    }
+  }
+
+  /**
+   * Decide what a failure means for the conversation.
+   *
+   * An open failure is Scribe's problem, not the conversation's: it stays
+   * queued and uncounted, so a broken Scribe can't park the whole queue. A
+   * transcript failure counts; after {@link MAX_CONVERSATION_ATTEMPTS} the
+   * conversation goes to `review` rather than being retried forever.
+   */
+  private recordConversationFailure(convId: number, error: unknown): void {
+    const msg = error instanceof Error ? error.message : String(error);
+
+    if (error instanceof ScribeOpenError) {
+      this.log("ERROR", `Scribe: Could not start a session for conversation ${convId}: ${msg}`);
+      return;
+    }
+
+    const attempts = (this.conversationFailures.get(convId) ?? 0) + 1;
+    if (attempts >= MAX_CONVERSATION_ATTEMPTS) {
+      this.conversationFailures.delete(convId);
+      updateConversationProcessed(
+        convId,
+        "review",
+        `Scribe failed ${attempts} times; parked for review. Last error: ${msg}`,
+      );
+      this.log(
+        "ERROR",
+        `Scribe: Parked conversation ${convId} for review after ${attempts} failed attempts: ${msg}`,
+      );
+      return;
+    }
+
+    this.conversationFailures.set(convId, attempts);
+    updateConversationStatus(convId, "queued");
+    this.log(
+      "ERROR",
+      `Scribe: Failed conversation ${convId} (attempt ${attempts}/${MAX_CONVERSATION_ATTEMPTS}): ${msg}`,
+    );
+  }
+
+  /**
+   * Sleep for the given duration, but wake early if abort is signaled.
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.sleepAbort = new AbortController();
+      const timeout = setTimeout(() => {
+        this.sleepAbort = null;
+        resolve();
+      }, ms);
+
+      this.sleepAbort.signal.addEventListener("abort", () => {
+        clearTimeout(timeout);
+        this.sleepAbort = null;
+        resolve();
+      });
+    });
+  }
+}
+
+// ============================================================================
+// Response Parsing
+// ============================================================================
+
+interface ScribeResult {
+  skipped: boolean;
+  summary: string;
+}
+
+function extractAssistantText(message: SessionHistoryMessage): string {
+  return message.blocks
+    .flatMap((block) => {
+      if (block.type !== "text" || typeof block.content !== "string") return [];
+      const text = block.content.trim();
+      return text ? [text] : [];
+    })
+    .join("\n");
+}
+
+export function extractRecoveredScribeResponse(messages: SessionHistoryMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "assistant") continue;
+    const text = extractAssistantText(message);
+    if (text) return text;
+  }
+  return null;
+}
+
+async function recoverScribeResponse(
+  ctx: ExtensionContext,
+  sessionId: string,
+): Promise<string | null> {
+  try {
+    const history = (await ctx.call("session.get_history", {
+      sessionId,
+      cwd: scribeCwd(),
+      limit: 50,
+    })) as { messages?: SessionHistoryMessage[] };
+    return extractRecoveredScribeResponse(history.messages || []);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse Scribe's response text into a result.
+ * Scribe responds with either "SKIP: reason" or "SUMMARY: one-liner"
+ */
+function parseScribeResponse(rawText: string): ScribeResult {
+  const text = rawText.trim();
+
+  // Check for SKIP — may appear at start of line or inline after tool output
+  const skipMatch = text.match(/SKIP:\s*(.+?)(?:\n|$)/i);
+  if (skipMatch) {
+    return { skipped: true, summary: skipMatch[1].trim() };
+  }
+
+  // Check for SUMMARY — may appear at start of line or inline after tool output
+  const summaryMatch = text.match(/SUMMARY:\s*(.+?)(?:\n|$)/i);
+  if (summaryMatch) {
+    return { skipped: false, summary: summaryMatch[1].trim() };
+  }
+
+  // Fallback: use the last non-empty line as summary
+  const lines = text.split("\n").filter((l) => l.trim().length > 0);
+  const lastLine = lines[lines.length - 1]?.trim() || "Processed by Scribe";
+  return { skipped: false, summary: lastLine };
+}
+
+async function finalizeScribeConversation(
+  conversationId: number,
+  rawResponse: string,
+  queuedRemaining: number,
+  log: (level: string, msg: string) => void,
+  repoSync?: RepoSyncRequester,
+  ctx?: ExtensionContext,
+  startTimeMs?: number,
+): Promise<void> {
+  const elapsed =
+    typeof startTimeMs === "number" ? ((Date.now() - startTimeMs) / 1000).toFixed(1) : "recovered";
+  log(
+    "INFO",
+    `Scribe: [${conversationId}] Response received in ${elapsed}s (${rawResponse.length} chars)`,
+  );
+
+  const result = parseScribeResponse(rawResponse);
+
+  if (result.skipped) {
+    updateConversationProcessed(conversationId, "skipped", result.summary);
+    log("INFO", `Scribe: [${conversationId}] Skipped in ${elapsed}s — ${result.summary}`);
+  } else {
+    const filesWritten = await commitMemoryChanges(conversationId, result.summary, log);
+    const reviewReason = await verifyProcessing(conversationId, result.summary, filesWritten, log);
+
+    if (reviewReason) {
+      updateConversationProcessed(conversationId, "review", result.summary, filesWritten);
+      log(
+        "WARN",
+        `Scribe: [${conversationId}] Flagged for review in ${elapsed}s — ${reviewReason}`,
+      );
+    } else {
+      updateConversationProcessed(conversationId, "archived", result.summary, filesWritten);
+      log(
+        "INFO",
+        `Scribe: [${conversationId}] Archived in ${elapsed}s — ${filesWritten.length} files changed`,
+      );
+    }
+
+    if (filesWritten.length > 0) {
+      repoSync?.requestSync(`conversation:${conversationId}`);
+    }
+  }
+
+  ctx?.emit("memory.conversation_processed", {
+    conversationId,
+    status: result.skipped ? "skipped" : "archived",
+    queued: Math.max(queuedRemaining - 1, 0),
+  });
+}
+
+// ============================================================================
+// Verification
+// ============================================================================
+
+/** Minimum summary length that indicates a meaningful conversation was processed */
+const MIN_MEANINGFUL_SUMMARY_LENGTH = 50;
+
+/**
+ * Verify that Scribe's processing looks correct.
+ * Returns a reason string if flagging for review, or null if everything looks good.
+ *
+ * Checks:
+ * 1. Long summary but 0 files written → Scribe understood but didn't write
+ * 2. Reasoning log planned writes that don't match actual files → mismatch
+ */
+async function verifyProcessing(
+  conversationId: number,
+  summary: string,
+  filesWritten: string[],
+  log: (level: string, msg: string) => void,
+): Promise<string | null> {
+  // Check 1: Meaningful summary but no files written
+  // Filter out the log file itself from the count — only count memory files
+  const memoryFiles = filesWritten.filter((f) => !f.includes("scribe/logs/"));
+  if (memoryFiles.length === 0 && summary.length >= MIN_MEANINGFUL_SUMMARY_LENGTH) {
+    log(
+      "WARN",
+      `Scribe: [${conversationId}] Verification failed: summary is ${summary.length} chars but 0 memory files written`,
+    );
+    return `Summary produced (${summary.length} chars) but no memory files written`;
+  }
+
+  // Check 2: Reasoning log exists and planned writes don't match actual writes
+  // Scribe should use the numeric conversation ID, but may use session UUID — check both
+  const logPath = join(scribeLogsDir(), `${conversationId}.md`);
+  const logExists = existsSync(logPath) || filesWritten.some((f) => f.includes("scribe/logs/"));
+  if (logExists && existsSync(logPath)) {
+    try {
+      const logContent = await readFile(logPath, "utf-8");
+      const plannedPaths = parseLogPlannedFiles(logContent);
+
+      if (plannedPaths.length > 0 && memoryFiles.length === 0) {
+        log(
+          "WARN",
+          `Scribe: [${conversationId}] Verification failed: log planned ${plannedPaths.length} files but 0 were written`,
+        );
+        return `Reasoning log planned ${plannedPaths.length} file(s) but none were written`;
+      }
+    } catch {
+      // Log parsing failed — not a reason to flag
+    }
+  } else if (memoryFiles.length > 0 && !logExists) {
+    // Files were written but no reasoning log — worth noting but not blocking
+    log("WARN", `Scribe: [${conversationId}] No reasoning log found at ${logPath}`);
+  }
+
+  return null;
+}
+
+/**
+ * Parse the reasoning log to extract planned file paths.
+ * Looks for lines like "1. **episodes/...** —" or "- episodes/..." in the "Files to write/edit" section.
+ */
+function parseLogPlannedFiles(logContent: string): string[] {
+  const paths: string[] = [];
+  // Match lines with bold paths like **episodes/2025-10/...**  or **projects/...**
+  const boldPathRegex = /\*\*([a-z][\w-]+\/[\w/.-]+)\*\*/gi;
+  let match: RegExpExecArray | null;
+  while ((match = boldPathRegex.exec(logContent)) !== null) {
+    const p = match[1];
+    // Filter to only memory-relevant paths (not scribe/logs)
+    if (!p.startsWith("scribe/logs")) {
+      paths.push(p);
+    }
+  }
+  return paths;
+}
+
+async function runCommand(
+  cmd: string[],
+  cwd: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(cmd, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+
+  return {
+    exitCode,
+    stdout: stdout.trim(),
+    stderr: stderr.trim(),
+  };
+}
+
+// ============================================================================
+// Post-Processing
+// ============================================================================
+
+/**
+ * Git add and commit all changes in ~/memory/.
+ * Returns list of files that were changed (from git diff).
+ */
+async function commitMemoryChanges(
+  conversationId: number,
+  summary: string,
+  log: (level: string, msg: string) => void,
+): Promise<string[]> {
+  try {
+    // Stage all changes
+    const addResult = await runCommand(["git", "add", "-A"], memoryRoot());
+    if (addResult.exitCode !== 0) {
+      throw new Error(`git add exited with code ${addResult.exitCode}: ${addResult.stderr}`);
+    }
+
+    // Check if there are staged changes
+    const quietDiff = await runCommand(["git", "diff", "--cached", "--quiet"], memoryRoot());
+    if (quietDiff.exitCode === 0) {
+      return [];
+    }
+    if (quietDiff.exitCode !== 1) {
+      throw new Error(
+        `git diff --cached --quiet exited with code ${quietDiff.exitCode}: ${quietDiff.stderr}`,
+      );
+    }
+
+    // Get list of changed files before committing
+    const diffResult = await runCommand(["git", "diff", "--cached", "--name-only"], memoryRoot());
+    if (diffResult.exitCode !== 0) {
+      throw new Error(
+        `git diff --cached --name-only exited with code ${diffResult.exitCode}: ${diffResult.stderr}`,
+      );
+    }
+    const filesWritten = diffResult.stdout
+      ? diffResult.stdout.split("\n").map((f) => join(memoryRoot(), f))
+      : [];
+
+    // Commit with summary
+    const commitMsg = `scribe(${conversationId}): ${truncatePreservingSurrogates(summary, 100)}`;
+    const commitResult = await runCommand(["git", "commit", "-m", commitMsg], memoryRoot());
+    if (commitResult.exitCode !== 0) {
+      throw new Error(
+        `git commit exited with code ${commitResult.exitCode}: ${commitResult.stderr}`,
+      );
+    }
+
+    // Log the actual commit hash to verify it really committed
+    const commitHashResult = await runCommand(
+      ["git", "rev-parse", "--short", "HEAD"],
+      memoryRoot(),
+    );
+    if (commitHashResult.exitCode !== 0) {
+      throw new Error(
+        `git rev-parse exited with code ${commitHashResult.exitCode}: ${commitHashResult.stderr}`,
+      );
+    }
+    const commitHash = commitHashResult.stdout;
+    log("INFO", `Scribe: Git committed ${filesWritten.length} files (${commitHash})`);
+
+    return filesWritten;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    log("ERROR", `Scribe: Git commit failed: ${msg}`);
+    return [];
+  }
+}
+
+/**
+ * Pull with rebase then push ~/memory/ to remote.
+ * Best-effort — network failures are logged but don't block processing.
+ */
+export async function pushMemoryChanges(log: (level: string, msg: string) => void): Promise<void> {
+  try {
+    // Rebase local commits on top of remote to keep history linear
+    const pullResult = await runCommand(["git", "pull", "--rebase"], memoryRoot());
+    if (pullResult.exitCode !== 0) {
+      // If rebase fails (conflict), abort and log — don't push stale state
+      await runCommand(["git", "rebase", "--abort"], memoryRoot());
+      log("ERROR", `Scribe: Git pull --rebase failed (aborted): ${pullResult.stderr}`);
+      return;
+    }
+
+    const pushResult = await runCommand(["git", "push"], memoryRoot());
+    if (pushResult.exitCode !== 0) {
+      log("ERROR", `Scribe: Git push failed: ${pushResult.stderr}`);
+      return;
+    }
+
+    log("INFO", "Scribe: Git pushed to remote");
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    log("ERROR", `Scribe: Git push failed: ${msg}`);
+  }
+}

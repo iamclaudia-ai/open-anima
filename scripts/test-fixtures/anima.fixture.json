@@ -1,0 +1,49 @@
+{
+  // The config every test run sees, copied to a temp $ANIMA_HOME/.anima/anima.json by
+  // scripts/test-preload.ts. Shaped like anima.example.json, but every port and
+  // the tmux prefix are moved off the defaults (30085-30087, 31000-31999,
+  // "anima-*"), so nothing a test starts from it can reach, or be mistaken
+  // for, a running instance. A test that needs specific values writes its own
+  // config and points ANIMA_CONFIG or ANIMA_HOME at it.
+  "gateway": {
+    "port": 39986,
+    "host": "127.0.0.1"
+  },
+  "session": {
+    "model": "claude-sonnet-4-6"
+  },
+  "agentHost": {
+    "port": 39987,
+    // Not "anima-…": a live agent-host's reaper treats `anima-*` panes as its own.
+    "tmuxPrefix": "test-anima",
+    "claudeRuntime": "cli",
+    "claudeCli": {
+      "basePort": 39000
+    },
+    "persona": "lumen",
+    "personaMode": "append",
+    "idleStaleMs": 7200000,
+    "reapIntervalMs": 60000,
+    "reapTmuxOrphans": true
+  },
+  "extensions": {
+    "session": {
+      "enabled": true,
+      "hot": false,
+      "config": {
+        "model": "claude-sonnet-4-6",
+        "thinking": true,
+        "effort": "medium",
+        "spawnProfile": "auto"
+      }
+    },
+    "chat": { "enabled": true, "config": {} },
+    "memory": { "enabled": false, "config": {} },
+    "today": { "enabled": true, "config": { "intervalMinutes": 5, "projects": [] } },
+    "scheduler": { "enabled": true, "config": {} },
+    "notify": { "enabled": true, "config": { "delivery": { "type": "log" } } },
+    "hooks": { "enabled": true, "config": { "extraDirs": [] } },
+    "control": { "enabled": true, "config": {} },
+    "skills": { "enabled": true, "config": {} }
+  }
+}

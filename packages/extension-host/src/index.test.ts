@@ -1,0 +1,404 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { join } from "node:path";
+
+type HostMsg = Record<string, unknown>;
+
+class HostHarness {
+  private proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  private lines: HostMsg[] = [];
+  private stdoutDone = false;
+
+  constructor(config: Record<string, unknown> = {}) {
+    const fixture = join(import.meta.dir, "__fixtures__", "test-extension.ts");
+    this.proc = Bun.spawn(["bun", fixture, JSON.stringify(config)], {
+      cwd: join(import.meta.dir, "..", "..", ".."),
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    this.readStdout();
+    this.readStderr();
+  }
+
+  async waitFor(predicate: (msg: HostMsg) => boolean, timeoutMs = 3000): Promise<HostMsg> {
+    const existing = this.lines.find(predicate);
+    if (existing) return existing;
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await Bun.sleep(10);
+      const found = this.lines.find(predicate);
+      if (found) return found;
+      if (this.stdoutDone) break;
+    }
+
+    throw new Error(`Timed out waiting for host message. Seen: ${JSON.stringify(this.lines)}`);
+  }
+
+  send(msg: HostMsg): void {
+    this.proc.stdin.write(JSON.stringify(msg) + "\n");
+  }
+
+  async stop(): Promise<void> {
+    try {
+      this.proc.stdin.end();
+    } catch {
+      // ignore
+    }
+
+    const exited = await Promise.race([
+      this.proc.exited.then(() => true),
+      Bun.sleep(2000).then(() => false),
+    ]);
+    if (!exited) {
+      this.proc.kill("SIGKILL");
+      await this.proc.exited;
+    }
+  }
+
+  private async readStdout(): Promise<void> {
+    const reader = this.proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          try {
+            this.lines.push(JSON.parse(line) as HostMsg);
+          } catch {
+            // ignore non-json noise
+          }
+        }
+      }
+    } finally {
+      this.stdoutDone = true;
+    }
+  }
+
+  private async readStderr(): Promise<void> {
+    const reader = this.proc.stderr.getReader();
+    try {
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+describe("runExtensionHost", () => {
+  let host: HostHarness | null = null;
+
+  afterEach(async () => {
+    if (host) {
+      await host.stop();
+      host = null;
+    }
+  });
+
+  it("registers and handles req with connection/tag context", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "req",
+      id: "r1",
+      method: "fixture.echo",
+      params: { value: "ok" },
+      connectionId: "conn-1",
+      tags: ["voice"],
+      traceId: "trace-1",
+      depth: 2,
+      deadlineMs: Date.now() + 60_000,
+    });
+
+    const res = await host.waitFor((m) => m.type === "res" && m.id === "r1");
+    expect(res.ok).toBe(true);
+    expect(res.payload).toEqual({
+      params: { value: "ok" },
+      connectionId: "conn-1",
+      tags: ["voice"],
+    });
+  });
+
+  it("stamps ambient envelope metadata on ctx.emit and ctx.call", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "req",
+      id: "r2",
+      method: "fixture.emit_context",
+      params: {},
+      connectionId: "conn-emit",
+      tags: ["t-emit"],
+      traceId: "trace-emit",
+      depth: 1,
+      deadlineMs: Date.now() + 60_000,
+    });
+    const evt = await host.waitFor((m) => m.type === "event" && m.event === "fixture.context");
+    expect(evt.connectionId).toBe("conn-emit");
+    expect(evt.tags).toEqual(["t-emit"]);
+
+    host.send({
+      type: "req",
+      id: "r3",
+      method: "fixture.call_through",
+      params: {},
+      connectionId: "conn-call",
+      tags: ["t-call"],
+      traceId: "trace-call",
+      depth: 4,
+      deadlineMs: Date.now() + 60_000,
+    });
+    const call = await host.waitFor((m) => m.type === "call" && m.method === "session.send_prompt");
+    expect(call.connectionId).toBe("conn-call");
+    expect(call.tags).toEqual(["t-call"]);
+    expect(call.traceId).toBe("trace-call");
+    expect(call.depth).toBe(5);
+
+    host.send({
+      type: "call_res",
+      id: call.id,
+      ok: true,
+      payload: { text: "pong" },
+    });
+    const res = await host.waitFor((m) => m.type === "res" && m.id === "r3");
+    expect(res.ok).toBe(true);
+    expect(res.payload).toEqual({ text: "pong" });
+  });
+
+  it("allows ctx.call during extension start", async () => {
+    host = new HostHarness({ startCallMethod: "startup.call" });
+
+    await host.waitFor((m) => m.type === "register");
+    const startupCall = await host.waitFor((m) => m.type === "call" && m.method === "startup.call");
+    host.send({
+      type: "call_res",
+      id: startupCall.id,
+      ok: true,
+      payload: { ok: true, via: "start" },
+    });
+
+    const startedCallResult = await host.waitFor(
+      (m) => m.type === "event" && m.event === "fixture.started_call_result",
+    );
+    expect(startedCallResult.payload).toEqual({ ok: true, via: "start" });
+
+    host.send({ type: "req", id: "post-start", method: "__health", params: {} });
+    const health = await host.waitFor((m) => m.type === "res" && m.id === "post-start");
+    expect(health.ok).toBe(true);
+  });
+
+  it("uses event envelope context for handler-initiated ctx.call/emit", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "event",
+      event: "trigger.call",
+      payload: {},
+      connectionId: "conn-event",
+      tags: ["t-event"],
+    });
+
+    const call = await host.waitFor((m) => m.type === "call" && m.method === "from.event");
+    expect(call.connectionId).toBe("conn-event");
+    expect(call.tags).toEqual(["t-event"]);
+    expect(call.depth).toBe(1);
+
+    host.send({ type: "call_res", id: call.id, ok: true, payload: { ok: true } });
+    const event = await host.waitFor(
+      (m) => m.type === "event" && m.event === "fixture.after_event",
+    );
+    expect(event.connectionId).toBe("conn-event");
+    expect(event.tags).toEqual(["t-event"]);
+  });
+
+  it("handles __health, __sourceResponse, and method errors", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({ type: "req", id: "h1", method: "__health", params: {} });
+    const health = await host.waitFor((m) => m.type === "res" && m.id === "h1");
+    expect(health.ok).toBe(true);
+    expect(health.payload).toEqual({ ok: true, details: { fixture: true } });
+
+    host.send({
+      type: "req",
+      id: "s1",
+      method: "__sourceResponse",
+      params: {
+        source: "fixture-src/client-1",
+        event: { type: "session.done", payload: {}, timestamp: Date.now() },
+      },
+      connectionId: "conn-src",
+      tags: ["src-tag"],
+    });
+    const sourceRes = await host.waitFor((m) => m.type === "res" && m.id === "s1");
+    expect(sourceRes.ok).toBe(true);
+    const routedEvent = await host.waitFor(
+      (m) => m.type === "event" && m.event === "fixture.routed",
+    );
+    expect(routedEvent.connectionId).toBe("conn-src");
+    expect(routedEvent.tags).toEqual(["src-tag"]);
+
+    host.send({ type: "req", id: "e1", method: "fixture.fail", params: {} });
+    const err = await host.waitFor((m) => m.type === "res" && m.id === "e1");
+    expect(err.ok).toBe(false);
+    expect(String(err.error)).toContain("fixture boom");
+  });
+
+  it("lets health checks and heartbeat bypass a blocked regular request", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "req",
+      id: "block-1",
+      method: "fixture.block",
+      params: { ms: 400, resourceId: "resource-1" },
+      connectionId: "conn-block",
+      tags: ["blocked"],
+    });
+
+    host.send({
+      type: "req",
+      id: "health-1",
+      method: "fixture.health_check",
+      params: {},
+      connectionId: "conn-health",
+      tags: ["health"],
+    });
+
+    const health = await host.waitFor((m) => m.type === "res" && m.id === "health-1");
+    expect(health.ok).toBe(true);
+    expect(health.payload).toEqual({
+      ok: true,
+      connectionId: "conn-health",
+      tags: ["health"],
+    });
+
+    host.send({
+      type: "event",
+      event: "gateway.heartbeat",
+      payload: {},
+      connectionId: "conn-heartbeat",
+      tags: ["heartbeat"],
+    });
+
+    const heartbeatEvent = await host.waitFor(
+      (m) => m.type === "event" && m.event === "fixture.heartbeat_seen",
+    );
+    expect(heartbeatEvent.connectionId).toBe("conn-heartbeat");
+    expect(heartbeatEvent.tags).toEqual(["heartbeat"]);
+
+    const blockRes = await host.waitFor((m) => m.type === "res" && m.id === "block-1");
+    expect(blockRes.ok).toBe(true);
+  });
+
+  it("lets read lane requests bypass a long-running keyed request", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "req",
+      id: "block-2",
+      method: "fixture.block",
+      params: { ms: 400, resourceId: "resource-2" },
+    });
+
+    host.send({
+      type: "req",
+      id: "read-1",
+      method: "fixture.read_fast",
+      params: { value: "fast" },
+    });
+
+    const readRes = await host.waitFor((m) => m.type === "res" && m.id === "read-1");
+    expect(readRes.ok).toBe(true);
+    expect(readRes.payload).toEqual({ ok: true, value: "fast" });
+
+    const blockRes = await host.waitFor((m) => m.type === "res" && m.id === "block-2");
+    expect(blockRes.ok).toBe(true);
+  });
+
+  it("serializes keyed requests per resource while allowing different keys to run", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "req",
+      id: "key-a1",
+      method: "fixture.block",
+      params: { ms: 250, resourceId: "same-key" },
+    });
+    host.send({
+      type: "req",
+      id: "key-a2",
+      method: "fixture.block",
+      params: { ms: 10, resourceId: "same-key" },
+    });
+    host.send({
+      type: "req",
+      id: "key-b1",
+      method: "fixture.block",
+      params: { ms: 10, resourceId: "other-key" },
+    });
+
+    const firstFast = await host.waitFor((m) => m.type === "res" && m.id === "key-b1");
+    expect(firstFast.ok).toBe(true);
+
+    const firstSame = await host.waitFor((m) => m.type === "res" && m.id === "key-a1");
+    const secondSame = await host.waitFor((m) => m.type === "res" && m.id === "key-a2");
+    expect(firstSame.ok).toBe(true);
+    expect(secondSame.ok).toBe(true);
+  });
+
+  it("serializes keyed requests by connectionId while allowing different connections to run", async () => {
+    host = new HostHarness();
+    await host.waitFor((m) => m.type === "register");
+
+    host.send({
+      type: "req",
+      id: "conn-a1",
+      method: "fixture.block_by_connection",
+      params: { ms: 250 },
+      connectionId: "conn-a",
+    });
+    host.send({
+      type: "req",
+      id: "conn-a2",
+      method: "fixture.block_by_connection",
+      params: { ms: 10 },
+      connectionId: "conn-a",
+    });
+    host.send({
+      type: "req",
+      id: "conn-b1",
+      method: "fixture.block_by_connection",
+      params: { ms: 10 },
+      connectionId: "conn-b",
+    });
+
+    const otherConnection = await host.waitFor((m) => m.type === "res" && m.id === "conn-b1");
+    expect(otherConnection.ok).toBe(true);
+    expect(otherConnection.payload).toEqual({ ok: true, ms: 10, connectionId: "conn-b" });
+
+    const firstSame = await host.waitFor((m) => m.type === "res" && m.id === "conn-a1");
+    const secondSame = await host.waitFor((m) => m.type === "res" && m.id === "conn-a2");
+    expect(firstSame.ok).toBe(true);
+    expect(secondSame.ok).toBe(true);
+    expect(firstSame.payload).toEqual({ ok: true, ms: 250, connectionId: "conn-a" });
+    expect(secondSame.payload).toEqual({ ok: true, ms: 10, connectionId: "conn-a" });
+  });
+});

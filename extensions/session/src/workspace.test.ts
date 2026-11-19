@@ -1,0 +1,192 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import {
+  createWorkspace,
+  deleteWorkspace,
+  findWorkspace,
+  getOrCreateWorkspace,
+  listWorkspaces,
+  parseGithubRemote,
+  updateWorkspaceProject,
+} from "./workspace";
+import { closeDb, getWorkspace, getWorkspaceByCwd } from "./workspace-db";
+
+describe("workspace db", () => {
+  let dataDir: string;
+  let prevDataDir: string | undefined;
+
+  beforeEach(() => {
+    prevDataDir = process.env.ANIMA_DATA_DIR;
+    dataDir = mkdtempSync(join(tmpdir(), "anima-workspace-db-"));
+    process.env.ANIMA_DATA_DIR = dataDir;
+    closeDb();
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (prevDataDir === undefined) {
+      delete process.env.ANIMA_DATA_DIR;
+    } else {
+      process.env.ANIMA_DATA_DIR = prevDataDir;
+    }
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("soft-deletes: hidden from lists and lookups, still reachable by id", () => {
+    const cwd = join(dataDir, "repo", "gone");
+    const created = createWorkspace({ name: "gone", cwd });
+    updateWorkspaceProject(created.id, { aliases: ["vanished"] });
+
+    expect(deleteWorkspace(cwd)).toBe(true);
+    expect(deleteWorkspace(cwd)).toBe(false);
+
+    expect(listWorkspaces().map((w) => w.id)).not.toContain(created.id);
+    expect(listWorkspaces({ deleted: true }).map((w) => w.id)).toEqual([created.id]);
+    expect(findWorkspace({ name: "vanished" })).toBeNull();
+    // Sessions still point at it, so a direct lookup keeps working.
+    expect(getWorkspace(created.id)?.deletedAt).toBeTruthy();
+  });
+
+  it("an explicit get-or-create restores a deleted workspace; internal lookups don't", () => {
+    const cwd = join(dataDir, "repo", "back");
+    mkdirSync(cwd, { recursive: true });
+    const created = createWorkspace({ name: "back", cwd });
+    updateWorkspaceProject(created.id, { githubRepo: "me/back" });
+    deleteWorkspace(cwd);
+
+    const internal = getOrCreateWorkspace(cwd);
+    expect(internal.workspace.id).toBe(created.id);
+    expect(internal.workspace.deletedAt).toBeTruthy();
+    expect(listWorkspaces().map((w) => w.id)).not.toContain(created.id);
+
+    const restored = getOrCreateWorkspace(cwd, undefined, undefined, { restore: true });
+    expect(restored).toMatchObject({ created: false, restored: true });
+    expect(restored.workspace.id).toBe(created.id);
+    expect(restored.workspace.deletedAt).toBeNull();
+    expect(restored.workspace.githubRepo).toBe("me/back");
+    expect(listWorkspaces().map((w) => w.id)).toContain(created.id);
+  });
+
+  it("creates, fetches, and lists workspaces", () => {
+    const cwd = join(dataDir, "repo", "a");
+    const created = createWorkspace({ name: "project-a", cwd, general: true });
+    expect(created.id).toMatch(/^ws_/);
+    expect(created.name).toBe("project-a");
+    expect(created.cwd).toBe(cwd);
+    expect(created.general).toBe(true);
+
+    const byId = getWorkspace(created.id);
+    expect(byId).toEqual(created);
+
+    const byCwd = getWorkspaceByCwd(cwd);
+    expect(byCwd).toEqual(created);
+
+    const listed = listWorkspaces();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toEqual(created);
+  });
+
+  it("getOrCreateWorkspace is idempotent per cwd", () => {
+    const cwd = join(dataDir, "repo", "b");
+    const first = getOrCreateWorkspace(cwd, "project-b", true);
+    expect(first.created).toBe(true);
+    expect(first.workspace.name).toBe("project-b");
+    expect(first.workspace.general).toBe(true);
+
+    const second = getOrCreateWorkspace(cwd, "ignored-name", false);
+    expect(second.created).toBe(false);
+    expect(second.workspace.id).toBe(first.workspace.id);
+    expect(second.workspace.name).toBe("project-b");
+    expect(second.workspace.general).toBe(true);
+  });
+
+  it("derives workspace name from cwd basename when name is omitted", () => {
+    const result = getOrCreateWorkspace(join(dataDir, "repo", "my-folder"));
+    expect(result.created).toBe(true);
+    expect(result.workspace.name).toBe("my-folder");
+    expect(result.workspace.general).toBe(false);
+  });
+
+  it("expands tilde paths and creates directories recursively", () => {
+    const uniqueFolder = `anima-test-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const tildePath = `~/projects/${uniqueFolder}`;
+    const expectedPath = join(homedir(), "projects", uniqueFolder);
+
+    try {
+      const result = getOrCreateWorkspace(tildePath, "anima");
+      expect(result.created).toBe(true);
+      expect(result.workspace.cwd).toBe(expectedPath);
+      expect(statSync(expectedPath).isDirectory()).toBe(true);
+    } finally {
+      rmSync(expectedPath, { recursive: true, force: true });
+    }
+  });
+
+  it("throws when cwd exists as a file", () => {
+    const filePath = join(dataDir, "not-a-directory");
+    writeFileSync(filePath, "x");
+
+    expect(() => getOrCreateWorkspace(filePath)).toThrow("Path exists but is not a directory");
+  });
+
+  it("reopens database after closeDb without data loss", () => {
+    const created = createWorkspace({ name: "project-c", cwd: "/repo/c" });
+    closeDb();
+
+    const listed = listWorkspaces();
+    expect(listed.some((w) => w.id === created.id)).toBe(true);
+  });
+
+  it("returns null for missing workspace id/cwd lookups", () => {
+    expect(getWorkspace("ws_missing")).toBeNull();
+    expect(getWorkspaceByCwd(join(dataDir, "repo", "missing"))).toBeNull();
+  });
+
+  it("stores project fields and resolves a project by name, alias or repo", () => {
+    const notes = createWorkspace({ name: "notes", cwd: "/repo/notes" });
+    const other = createWorkspace({ name: "anima", cwd: "/repo/anima" });
+    expect(notes.aliases).toEqual([]);
+    expect(notes.githubRepo).toBeNull();
+
+    const updated = updateWorkspaceProject(notes.id, {
+      description: "  Notesy  ",
+      aliases: ["Notesy", "the notes app", "notesy", " "],
+      githubRepo: "alex/notes-app",
+    });
+    expect(updated).toMatchObject({
+      description: "Notesy",
+      aliases: ["notesy", "the notes app"],
+      githubRepo: "alex/notes-app",
+    });
+
+    expect(findWorkspace({ name: "NOTES" })?.id).toBe(notes.id);
+    expect(findWorkspace({ name: "The Notes App" })?.id).toBe(notes.id);
+    expect(findWorkspace({ githubRepo: "Alex/Notes-App" })?.id).toBe(notes.id);
+    expect(findWorkspace({ name: "anima" })?.id).toBe(other.id);
+    expect(findWorkspace({ name: "nope" })).toBeNull();
+
+    // Omitted fields stay; null clears.
+    const cleared = updateWorkspaceProject(notes.id, { githubRepo: null, description: null });
+    expect(cleared?.githubRepo).toBeNull();
+    expect(cleared?.description).toBeNull();
+    expect(cleared?.aliases).toEqual(["notesy", "the notes app"]);
+    expect(updateWorkspaceProject("ws_missing", { description: "x" })).toBeNull();
+  });
+
+  it("refuses to guess when an alias is shared", () => {
+    const a = createWorkspace({ name: "a", cwd: "/repo/a" });
+    const b = createWorkspace({ name: "b", cwd: "/repo/b" });
+    updateWorkspaceProject(a.id, { aliases: ["shared"] });
+    updateWorkspaceProject(b.id, { aliases: ["shared"] });
+    expect(findWorkspace({ name: "shared" })).toBeNull();
+  });
+
+  it("parses GitHub remotes", () => {
+    expect(parseGithubRemote("git@github.com:alex/notes-app.git")).toBe("alex/notes-app");
+    expect(parseGithubRemote("https://github.com/acme/anima.git\n")).toBe("acme/anima");
+    expect(parseGithubRemote("https://github.com/owner/repo")).toBe("owner/repo");
+    expect(parseGithubRemote("https://gitlab.com/owner/repo.git")).toBeNull();
+  });
+});

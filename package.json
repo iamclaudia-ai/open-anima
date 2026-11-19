@@ -1,0 +1,113 @@
+{
+  "name": "open-anima",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "clients/*",
+    "extensions/*"
+  ],
+  "scripts": {
+    "dev": "bun run --filter @anima/gateway dev",
+    "restart": "bun run dev",
+    "watchdog": "bun run packages/watchdog/src/index.ts",
+    "watchdog:deploy": "bun run --filter @anima/watchdog deploy",
+    "watchdog:reload": "bun run watchdog:deploy && bun run cli watchdog reload",
+    "cli": "bun run packages/cli/src/index.ts",
+    "deps:catalog": "bun run scripts/bump-catalog-dependency.ts",
+    "deps:outdated": "bun run scripts/outdated-report.ts",
+    "deps:drift": "bun run scripts/check-dependency-drift.ts",
+    "deps:drift:check": "bun run scripts/check-dependency-drift.ts --fail-on-drift",
+    "build": "bun run --filter '*' build",
+    "test": "bun test ./packages ./extensions ./scripts ./hooks",
+    "test:coverage": "bun test ./packages ./extensions ./scripts ./hooks --coverage --coverage-reporter=text",
+    "test:coverage:lcov": "bun test ./packages ./extensions ./scripts ./hooks --coverage --coverage-reporter=lcov --coverage-dir coverage",
+    "test:unit": "bun test packages/cli/src/index.test.ts packages/cli/src/extension-cli.test.ts extensions/skills/src/inventory.test.ts extensions/skills/src/placement.test.ts packages/gateway/src/extensions.test.ts packages/ui/src/components/layout-flatten.test.ts extensions/control/src/index.test.ts",
+    "test:integration": "bun test packages/gateway/src/extensions.integration.test.ts",
+    "test:smoke": "bun run scripts/smoke.ts",
+    "test:e2e": "bun run scripts/e2e-smoke.ts",
+    "test:smoke-all": "bun run test:unit && bun run test:integration && bun run test:smoke",
+    "typecheck": "tsgo --noEmit",
+    "typecheck:all": "bun run typecheck",
+    "precommit": "bun run typecheck && bunx lint-staged",
+    "prepush": "bun run typecheck && bun run test:unit && bun run docs:api:check && bun run react-doctor:diff",
+    "react-doctor": "NO_COLOR=1 react-doctor -y --offline",
+    "react-doctor:diff": "git rev-parse -q --verify origin/main >/dev/null || { echo '[prepush] no origin/main yet (first push of a new repo): skipping the react-doctor diff'; exit 0; }; NO_COLOR=1 react-doctor -y --scope changed --base origin/main --blocking error --offline",
+    "react-doctor:staged": "NO_COLOR=1 react-doctor -y --staged --blocking error --offline",
+    "prepare": "husky",
+    "lint": "oxlint .",
+    "format": "bunx oxfmt --write .",
+    "docs:api": "bun run scripts/generate-api-reference.ts && bun run format",
+    "docs:api:check": "bun run docs:api && (git diff --quiet -- docs/API-REFERENCE.md && git diff --cached --quiet -- docs/API-REFERENCE.md || (echo \"[prepush] docs/API-REFERENCE.md changed after generation. Commit the regenerated file.\"; exit 1))"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "catalog:",
+    "dockview": "5.1.0",
+    "dockview-react": "5.1.0",
+    "fuzzysort": "4.0.2",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "catalog:",
+    "@types/bun": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "bun-plugin-tailwind": "catalog:",
+    "bun-types": "1.4.4",
+    "husky": "9.1.7",
+    "lint-staged": "17.6.0",
+    "oxfmt": "0.78.0",
+    "oxlint": "1.93.0",
+    "react-doctor": "0.9.22",
+    "tailwindcss": "catalog:",
+    "typescript": "catalog:",
+    "zod": "catalog:"
+  },
+  "overrides": {
+    "minimatch": "11.0.3",
+    "postcss-selector-parser": "7.1.6",
+    "uuid": "11.1.1"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx,mjs,cjs}": [
+      "bunx oxfmt --write",
+      "oxlint"
+    ],
+    "*.{json,md,css,html,yml,yaml,toml}": [
+      "bunx oxfmt --write"
+    ]
+  },
+  "catalog": {
+    "@anthropic-ai/claude-agent-sdk": "0.2.141",
+    "@anthropic-ai/sdk": "1.8.0",
+    "@tailwindcss/typography": "0.5.20",
+    "@typescript/native-preview": "7.0.0-dev.20260523.1",
+    "@types/bun": "1.4.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "bun-plugin-tailwind": "0.1.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tailwindcss": "4.3.5",
+    "typescript": "7.0.2",
+    "zod": "4.6.7",
+    "@types/node": "26.6.6",
+    "react-markdown": "10.1.0",
+    "lucide-react": "0.563.0"
+  },
+  "reactDoctor": {
+    "ignore": {
+      "rules": [
+        "react-doctor/design-no-default-tailwind-palette",
+        "react-doctor/design-no-em-dash-in-jsx-text",
+        "react-doctor/js-combine-iterations",
+        "react-doctor/no-generic-handler-names",
+        "react-doctor/design-no-three-period-ellipsis",
+        "react-doctor/no-gray-on-colored-background",
+        "react-doctor/rerender-state-only-in-handlers"
+      ]
+    }
+  }
+}

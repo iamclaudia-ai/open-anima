@@ -1,0 +1,75 @@
+#!/bin/bash
+# Run Claude Code on the Claude account the current folder belongs to.
+#
+# Walks up from the working directory to the nearest `.claude-account` file. Its
+# first line names the account (`acme`); that account's `claude setup-token`
+# token lives in the macOS Keychain under `anima-claude-account-<name>` and is
+# exported as CLAUDE_CODE_OAUTH_TOKEN, which Claude Code prefers over its stored
+# login. With no marker, or a marker saying `default`, the token is cleared and
+# Claude uses its own login.
+#
+# A marker naming an account with no token fails loudly: falling back to the
+# default account would send that folder's work through the wrong subscription.
+#
+# Usage:
+#   claude-for-folder [claude args...]   exec claude (CLAUDE_BIN, default `claude`)
+#   claude-for-folder --resolve-account  print the account name (`default` when
+#                                        none), after checking its token exists
+#
+# The token never appears on a command line: it is read here and exported.
+
+set -euo pipefail
+
+MARKER=".claude-account"
+KEYCHAIN_PREFIX="anima-claude-account-"
+
+die() {
+  echo "claude-for-folder: $*" >&2
+  exit 1
+}
+
+# Print the account named by the nearest marker, or `default`.
+resolve_account() {
+  local dir
+  dir=$(pwd -P)
+  while true; do
+    if [[ -f "$dir/$MARKER" ]]; then
+      local name
+      name=$(head -n 1 "$dir/$MARKER" | tr -d '[:space:]')
+      [[ -n "$name" ]] || die "$dir/$MARKER is empty; write an account name or 'default'"
+      [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+        die "$dir/$MARKER names '$name'; use lowercase letters, digits, '-' or '_'"
+      echo "$name"
+      return
+    fi
+    [[ "$dir" == "/" ]] && break
+    dir=$(dirname "$dir")
+  done
+  echo "default"
+}
+
+# Print the account's token from the Keychain, or fail naming the fix.
+account_token() {
+  local name="$1" token
+  token=$(security find-generic-password -s "$KEYCHAIN_PREFIX$name" -w 2>/dev/null) ||
+    die "no token for Claude account '$name' (Keychain item '$KEYCHAIN_PREFIX$name'). Create one with 'claude setup-token', then 'security add-generic-password -s $KEYCHAIN_PREFIX$name -a \"\$USER\" -w' and paste the token."
+  [[ -n "$token" ]] || die "Keychain item '$KEYCHAIN_PREFIX$name' is empty"
+  printf '%s' "$token"
+}
+
+account=$(resolve_account)
+
+if [[ "$account" == "default" ]]; then
+  unset CLAUDE_CODE_OAUTH_TOKEN
+else
+  token=$(account_token "$account")
+  export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  unset token
+fi
+
+if [[ "${1:-}" == "--resolve-account" ]]; then
+  echo "$account"
+  exit 0
+fi
+
+exec "${CLAUDE_BIN:-claude}" "$@"

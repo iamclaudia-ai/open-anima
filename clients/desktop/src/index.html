@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Today</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fbf7f0;
+        --fg: #6b6157;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1c1a17;
+          --fg: #a69d92;
+        }
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Shown until the gateway answers; the app then loads the board itself (lib.rs, load_board). -->
+    <p>Waiting for Anima…</p>
+  </body>
+</html>

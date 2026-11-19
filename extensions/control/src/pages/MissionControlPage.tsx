@@ -1,0 +1,422 @@
+/**
+ * Mission Control Dashboard
+ *
+ * Discovers extensions with health-check methods and renders their status
+ * generically based on the HealthCheckResponse shape.
+ */
+
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Link } from "@anima/ui";
+import type { HealthCheckResponse, HealthAction, HealthItem } from "@anima/shared";
+import { useGatewayRpc } from "../hooks/useGatewayRpc";
+
+// ── Types ────────────────────────────────────────────────────
+
+interface ExtensionInfo {
+  id: string;
+  name: string;
+  methods: string[];
+}
+
+interface ExtensionHealth {
+  extension: ExtensionInfo;
+  health: HealthCheckResponse | null;
+  rawPayload?: unknown;
+  error?: string;
+}
+
+function normalizeHealthResponse(extension: ExtensionInfo, payload: unknown): HealthCheckResponse {
+  const raw = (payload ?? {}) as Record<string, unknown>;
+  const status = typeof raw.status === "string" ? raw.status : "error";
+  const label =
+    typeof raw.label === "string" && raw.label.trim().length > 0 ? raw.label : extension.name;
+
+  const metrics = Array.isArray(raw.metrics)
+    ? (raw.metrics as HealthCheckResponse["metrics"])
+    : buildFallbackMetrics(raw);
+  const actions = Array.isArray(raw.actions)
+    ? (raw.actions as HealthAction[])
+    : ([] as HealthAction[]);
+  const items = Array.isArray(raw.items) ? (raw.items as HealthItem[]) : ([] as HealthItem[]);
+  const ok = typeof raw.ok === "boolean" ? raw.ok : status !== "error";
+
+  return {
+    ok,
+    status,
+    label,
+    metrics,
+    actions,
+    items,
+  };
+}
+
+function buildFallbackMetrics(raw: Record<string, unknown>) {
+  const metrics: Array<{ label: string; value: string | number }> = [];
+
+  if (typeof raw.message === "string" && raw.message.trim().length > 0) {
+    metrics.push({ label: "Message", value: raw.message });
+  }
+
+  if (typeof raw.uptime === "number") {
+    metrics.push({ label: "Uptime", value: `${Math.round(raw.uptime)}s` });
+  }
+
+  if (raw.stats && typeof raw.stats === "object") {
+    for (const [key, value] of Object.entries(raw.stats as Record<string, unknown>)) {
+      if (typeof value === "string" || typeof value === "number") {
+        metrics.push({ label: key, value });
+      }
+    }
+  }
+
+  return metrics;
+}
+
+// ── Status Dot Component ─────────────────────────────────────
+
+function StatusDot({ status }: { status: string }) {
+  const colors: Record<string, string> = {
+    healthy: "bg-emerald-400",
+    degraded: "bg-yellow-400",
+    stale: "bg-yellow-400",
+    error: "bg-red-400",
+    dead: "bg-red-400",
+    disconnected: "bg-red-400",
+    inactive: "bg-zinc-500",
+  };
+  const color = colors[status] || "bg-zinc-500";
+  return (
+    <span
+      className={`inline-block size-2.5 rounded-full ${color} ${status === "healthy" ? "animate-pulse" : ""}`}
+    />
+  );
+}
+
+// ── Extension Health Card ────────────────────────────────────
+
+function HealthCard({
+  data,
+  onAction,
+}: {
+  data: ExtensionHealth;
+  onAction: (action: HealthAction, itemId?: string) => void;
+}) {
+  const { health, error } = data;
+  const [showRaw, setShowRaw] = useState(false);
+
+  if (error || !health) {
+    return (
+      <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/50 p-5">
+        <div className="flex items-center gap-2 mb-3">
+          <StatusDot status="error" />
+          <h3 className="text-sm font-medium text-zinc-200">{data.extension.name}</h3>
+        </div>
+        <p className="text-xs text-red-400">{error || "No response"}</p>
+      </div>
+    );
+  }
+
+  const globalActions = health.actions?.filter((a) => a.scope === "global") || [];
+
+  return (
+    <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/50 p-5">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <StatusDot status={health.status} />
+          <h3 className="text-sm font-medium text-zinc-200">
+            {health.label || data.extension.name}
+          </h3>
+          <span className="text-xs text-zinc-500 capitalize">{health.status}</span>
+        </div>
+        <div className="flex gap-2">
+          {data.rawPayload !== undefined && (
+            <button
+              onClick={() => setShowRaw((current) => !current)}
+              className="text-xs px-2.5 py-1 rounded-md bg-zinc-700/50 text-zinc-300 hover:bg-zinc-600/50 transition-colors"
+            >
+              {showRaw ? "Hide JSON" : "Show JSON"}
+            </button>
+          )}
+          {globalActions.map((action) => (
+            <button
+              key={action.method}
+              onClick={() => onAction(action)}
+              className="text-xs px-2.5 py-1 rounded-md bg-zinc-700/50 text-zinc-300 hover:bg-zinc-600/50 transition-colors"
+            >
+              {action.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Metrics */}
+      {health.metrics && health.metrics.length > 0 && (
+        <div className="flex flex-wrap gap-x-6 gap-y-1 mb-4">
+          {health.metrics.map((metric) => (
+            <div key={metric.label} className="text-xs">
+              <span className="text-zinc-500">{metric.label}: </span>
+              <span className="text-zinc-300">{metric.value}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Items Table */}
+      {health.items && health.items.length > 0 && (
+        <div className="mt-3 border-t border-zinc-700/30 pt-3">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-zinc-500">
+                <th className="text-left font-medium pb-2 pr-3">Status</th>
+                <th className="text-left font-medium pb-2 pr-3">Resource</th>
+                {/* Dynamic detail columns from first item */}
+                {health.items[0]?.details &&
+                  Object.keys(health.items[0].details).map((key) => (
+                    <th key={key} className="text-left font-medium pb-2 pr-3 capitalize">
+                      {key}
+                    </th>
+                  ))}
+                {health.actions?.some((a) => a.scope === "item") && (
+                  <th className="text-right font-medium pb-2">Actions</th>
+                )}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-700/30">
+              {health.items.map((item) => (
+                <ItemRow
+                  key={item.id}
+                  item={item}
+                  actions={health.actions?.filter((a) => a.scope === "item") || []}
+                  onAction={onAction}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {health.items && health.items.length === 0 && (
+        <p className="text-xs text-zinc-600 italic">No active resources</p>
+      )}
+
+      {showRaw && data.rawPayload !== undefined && (
+        <div className="mt-4 border-t border-zinc-700/30 pt-3">
+          <pre className="overflow-x-auto rounded-lg bg-zinc-950/80 p-3 text-[11px] leading-5 text-zinc-300">
+            {JSON.stringify(data.rawPayload, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Item Row ─────────────────────────────────────────────────
+
+function ItemRow({
+  item,
+  actions,
+  onAction,
+}: {
+  item: HealthItem;
+  actions: HealthAction[];
+  onAction: (action: HealthAction, itemId?: string) => void;
+}) {
+  return (
+    <tr className="text-zinc-300">
+      <td className="py-2 pr-3">
+        <StatusDot status={item.status} />
+      </td>
+      <td className="py-2 pr-3 font-mono text-zinc-400">
+        {item.label}
+        <span className="text-zinc-600 ml-2">
+          {item.id.length > 12 ? item.id.slice(0, 12) + "..." : item.id}
+        </span>
+      </td>
+      {item.details &&
+        Object.entries(item.details).map(([key, value]) => (
+          <td key={key} className="py-2 pr-3">
+            {value}
+          </td>
+        ))}
+      {actions.length > 0 && (
+        <td className="py-2 text-right">
+          <div className="flex gap-1.5 justify-end">
+            {actions.map((action) => (
+              <button
+                key={action.method}
+                onClick={() => onAction(action, item.id)}
+                className="px-2 py-0.5 rounded bg-red-900/30 text-red-400 hover:bg-red-900/50 transition-colors"
+              >
+                {action.label}
+              </button>
+            ))}
+          </div>
+        </td>
+      )}
+    </tr>
+  );
+}
+
+// ── Main Page Component ──────────────────────────────────────
+
+export function MissionControlPage() {
+  const { request, connected } = useGatewayRpc();
+  const [healthData, setHealthData] = useState<ExtensionHealth[]>([]);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [loading, setLoading] = useState(true);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refreshInFlightRef = useRef(false);
+
+  const refresh = useCallback(async () => {
+    if (!connected || refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+
+    try {
+      // Step 1: Discover extensions
+      const { extensions } = await request<{ extensions: ExtensionInfo[] }>(
+        "gateway.list_extensions",
+      );
+
+      // Step 2: Filter for health-check capable extensions
+      const healthExtensions = extensions.filter((ext: ExtensionInfo) =>
+        ext.methods.some((m: string) => m.endsWith(".health_check")),
+      );
+
+      // Step 3: Call each health-check in parallel
+      const results = await Promise.allSettled(
+        healthExtensions.map(async (ext: ExtensionInfo) => {
+          const healthMethod = ext.methods.find((m: string) => m.endsWith(".health_check"))!;
+          const payload = await request<unknown>(healthMethod);
+          const health = normalizeHealthResponse(ext, payload);
+          return { extension: ext, health, rawPayload: payload } as ExtensionHealth;
+        }),
+      );
+
+      const healthData = results.map((result: PromiseSettledResult<ExtensionHealth>, i: number) => {
+        if (result.status === "fulfilled") {
+          return result.value;
+        }
+        return {
+          extension: healthExtensions[i],
+          health: null,
+          error: result.reason?.message || "Failed to fetch health",
+        } as ExtensionHealth;
+      });
+
+      setHealthData(healthData);
+      setLastUpdated(new Date());
+    } catch (error) {
+      console.error("[MissionControl] Refresh failed:", error);
+    } finally {
+      refreshInFlightRef.current = false;
+      setLoading(false);
+    }
+  }, [connected, request]);
+
+  // Poll every 5 seconds
+  useEffect(() => {
+    if (!connected) return;
+
+    refresh();
+    intervalRef.current = setInterval(refresh, 5000);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [connected, refresh]);
+
+  // Handle actions
+  const handleAction = useCallback(
+    async (action: HealthAction, itemId?: string) => {
+      // Confirmation dialog
+      if (action.confirm) {
+        if (!window.confirm(action.confirm)) return;
+      }
+
+      // Resolve params
+      const params: Record<string, unknown> = {};
+      for (const param of action.params) {
+        if (param.source === "item.id" && itemId) {
+          params[param.name] = itemId;
+        } else if (param.source === "input") {
+          const value = window.prompt(`Enter ${param.name}:`);
+          if (value === null) return; // Cancelled
+          params[param.name] = value;
+        }
+      }
+
+      try {
+        await request(action.method, params);
+        // Refresh immediately after action
+        setTimeout(refresh, 500);
+      } catch (error) {
+        console.error(`[MissionControl] Action failed:`, error);
+      }
+    },
+    [request, refresh],
+  );
+
+  return (
+    <div className="min-h-screen bg-zinc-900 text-zinc-100">
+      {/* Header */}
+      <div className="border-b border-zinc-800 px-6 py-4">
+        <div className="flex items-center justify-between max-w-5xl mx-auto">
+          <div className="flex items-center gap-3">
+            <Link to="/" className="text-zinc-500 hover:text-zinc-300 transition-colors">
+              &larr;
+            </Link>
+            <h1 className="text-lg font-semibold">Mission Control</h1>
+            <span className="flex items-center gap-1.5 text-xs text-zinc-500">
+              <StatusDot status={connected ? "healthy" : "disconnected"} />
+              {connected ? "Connected" : "Disconnected"}
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            {lastUpdated && (
+              <span className="text-xs text-zinc-600">Updated {formatTimeAgo(lastUpdated)}</span>
+            )}
+            <Link
+              to="/logs"
+              className="text-xs px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-300 transition-colors"
+            >
+              View Logs
+            </Link>
+            <button
+              onClick={refresh}
+              className="text-xs px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-300 transition-colors"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="max-w-5xl mx-auto px-6 py-6">
+        {loading ? (
+          <div className="text-center py-12 text-zinc-500">Loading health data...</div>
+        ) : healthData.length === 0 ? (
+          <div className="text-center py-12 text-zinc-500">
+            No extensions with health checks found
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {healthData.map((data: ExtensionHealth) => (
+              <HealthCard key={data.extension.id} data={data} onAction={handleAction} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+
+function formatTimeAgo(date: Date): string {
+  const seconds = Math.round((Date.now() - date.getTime()) / 1000);
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  return `${Math.round(seconds / 60)}m ago`;
+}

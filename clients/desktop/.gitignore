@@ -1,0 +1,27 @@
+# Rust / Cargo (Cargo.lock is committed: an app, so builds and audits see the exact versions)
+src-tauri/target/
+
+# Tauri
+src-tauri/WixTools/
+src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build outputs
+*.app
+*.dmg
+*.deb
+*.AppImage

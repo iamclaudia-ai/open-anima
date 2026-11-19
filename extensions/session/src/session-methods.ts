@@ -1,0 +1,663 @@
+import { z } from "zod";
+import type { ExtensionMethodDefinition } from "@anima/shared";
+
+/** Who started a session; shared by create_session, spawn_agent and handoff. */
+const originField = (defaultIs: string) =>
+  z
+    .enum(["user", "automated"])
+    .optional()
+    .describe(
+      `Who started the session: "user" for one the user opened directly (the UI clients send it), "automated" for anything an agent, skill or task started. Automated sessions sit in the ACTIVE pane's collapsed Background group. Defaults to ${defaultIs}. Fixed for the session's life`,
+    );
+
+/** The launching session, shared by create_session and spawn_agent. */
+const launchedByField = z
+  .string()
+  .min(1)
+  .optional()
+  .describe(
+    "The session that launched this one (auto-injected from $ANIMA_SESSION_ID); the nav nests the new session under it. Not a subagent parent",
+  );
+
+/** `worktree` / `worktreeBase`, shared by create_session, spawn_agent and handoff. */
+const worktreeFields = (repoIs: string) => ({
+  worktree: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      `Start the session in a git worktree on this branch, at <repo>.worktrees/<branch> (created, or reused when it exists, then bootstrapped: tmp/ linked, CodeGraph seeded, or <repo>/tmp/scripts/create_worktree when executable). The repo is ${repoIs}`,
+    ),
+  worktreeBase: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Start point for a new worktree branch; defaults to origin's default branch, freshly fetched",
+    ),
+});
+
+const SpawnAgentSchema = z.object({
+  parentSessionId: z
+    .string()
+    .describe(
+      'Parent session UUID, or "NEW" to start a top-level session (created, named, and prompted in one call; cwd required)',
+    ),
+  name: z.string().optional().describe("Session title; defaults to one derived from the prompt"),
+  agent: z.string().optional().describe("Child agent/provider; defaults to the parent agent"),
+  prompt: z.string().min(1).describe("Initial child-agent prompt"),
+  purpose: z.enum(["subagent", "review", "test"]).optional().default("subagent"),
+  cwd: z
+    .string()
+    .optional()
+    .describe("Working directory override; with worktree, any folder in the repo to branch from"),
+  ...worktreeFields(
+    "the one cwd is in, else the parent's workspace root (for NEW, cwd is required)",
+  ),
+  model: z.string().optional().describe("Model override"),
+  systemPrompt: z
+    .string()
+    .optional()
+    .describe("Optional provider-specific system prompt/instructions"),
+  thinking: z.boolean().optional().describe("Provider-specific thinking toggle"),
+  effort: z.string().optional().describe("Effort/reasoning override (low|medium|high|max)"),
+  sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  profile: z
+    .string()
+    .regex(/^[a-z][a-z0-9-]{0,31}$/)
+    .optional()
+    .describe(
+      "Permission profile (yolo, auto, or one from agentHost.sessionProfiles); defaults to extensions.session.config.spawnProfile. Fixed for the session's life",
+    ),
+  origin: originField('"automated"'),
+  launchedBySessionId: launchedByField,
+});
+
+export const handoffSchema = z
+  .object({
+    sessionId: z
+      .string()
+      .min(1)
+      .describe("Session handing off (auto-injected from $ANIMA_SESSION_ID)"),
+    title: z.string().trim().min(1).max(200).describe("Title for the new session"),
+    prompt: z.string().min(1).optional().describe("The new session's first message"),
+    promptFile: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Read the first message from this file (relative to the caller's folder)"),
+    // Deliberately not `cwd`: the CLI fills any `cwd` param from the shell's
+    // working directory, which drifts, and a drifted folder would start the new
+    // session in the wrong workspace.
+    targetCwd: z
+      .string()
+      .optional()
+      .describe("Folder for the new session; defaults to the caller's workspace"),
+    ...worktreeFields("the caller's workspace root; can't be combined with targetCwd"),
+    model: z.string().optional().describe("Model; defaults to the caller's"),
+    profile: z
+      .string()
+      .regex(/^[a-z][a-z0-9-]{0,31}$/)
+      .optional()
+      .describe("Permission profile; defaults to the caller's"),
+    origin: originField("the caller's origin"),
+  })
+  .refine(
+    (p) => Boolean(p.prompt) !== Boolean(p.promptFile),
+    "Pass exactly one of prompt, promptFile",
+  )
+  .refine((p) => !(p.worktree && p.targetCwd), "Pass worktree or targetCwd, not both")
+  .refine((p) => !p.worktreeBase || p.worktree, "worktreeBase needs worktree");
+
+const nullableText = z.string().max(500).nullable().optional();
+
+export const workspaceUpdateSchema = z
+  .object({
+    id: z.string().optional().describe("Workspace ID (or pass cwd)"),
+    cwd: z.string().optional().describe("Workspace folder (or pass id)"),
+    name: z.string().min(1).max(100).optional(),
+    description: nullableText,
+    aliases: z.array(z.string().min(1).max(100)).max(20).optional(),
+    githubRepo: z
+      .string()
+      .regex(/^[\w.-]+\/[\w.-]+$/, "owner/repo")
+      .nullable()
+      .optional(),
+    detect: z.boolean().default(false).describe("Fill githubRepo from the git origin remote"),
+    addFolder: z
+      .union([z.string().min(1), z.array(z.string().min(1)).min(1).max(20)])
+      .optional()
+      .describe(
+        "Folder(s) to add. A worktree of a member repo joins as a worktree; any other folder joins as added and gets the root's Claude Code auto memory linked in",
+      ),
+    removeFolder: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Folder to take out of the workspace (not the root)"),
+    setRoot: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Active folder to make the root (the source of shared tmp/ and auto memory)"),
+    moveFolder: z
+      .object({
+        from: z.string().min(1).describe("The folder's old path (a member of this workspace)"),
+        to: z.string().min(1).describe("Where it is now; must exist"),
+      })
+      .optional()
+      .describe(
+        "Record a folder moved by hand: the new path joins (as root if the old one was), the old one stays as an inactive member, its sessions get the new path, and their transcript folders are linked at the new path",
+      ),
+    merge: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Let addFolder or moveFolder take a folder that is another workspace's root: that workspace's sessions and folders move here, its project fields are folded in, and it is deleted",
+      ),
+  })
+  .refine((p) => p.id || p.cwd, "Pass id or cwd");
+
+export const workspaceFindSchema = z
+  .object({
+    name: z.string().min(1).optional().describe("Workspace name or alias"),
+    githubRepo: z.string().min(3).optional().describe("owner/repo"),
+  })
+  .refine(
+    (p) => [p.name, p.githubRepo].filter(Boolean).length === 1,
+    "Pass exactly one of name, githubRepo",
+  );
+
+const GetSubagentSchema = z.object({
+  subagentId: z.string().describe("Subagent session ID"),
+});
+
+const ListSubagentsSchema = z.object({
+  parentSessionId: z.string().optional().describe("Filter by parent session ID"),
+  status: z.enum(["running", "completed", "failed", "interrupted"]).optional(),
+  agent: z.string().optional().describe("Filter by agent/provider"),
+});
+
+const InterruptSubagentSchema = z.object({
+  subagentId: z.string().describe("Subagent session ID"),
+});
+
+export const sessionMethodDefinitions: ExtensionMethodDefinition[] = [
+  {
+    name: "session.create_session",
+    description: "Create a new agent session for a workspace CWD",
+    inputSchema: z.object({
+      cwd: z
+        .string()
+        .describe("Working directory; with worktree, any folder in the repo to branch from"),
+      ...worktreeFields("the one cwd is in"),
+      title: z
+        .string()
+        .max(200)
+        .optional()
+        .describe("Session title; without one it comes from the first prompt"),
+      agent: z.string().optional().describe("Agent/provider (default: claude)"),
+      model: z.string().optional().describe("Model to use"),
+      systemPrompt: z.string().optional().describe("System prompt"),
+      thinking: z.boolean().optional().describe("Enable thinking"),
+      effort: z.enum(["low", "medium", "high", "max"]).optional().describe("Thinking effort"),
+      profile: z
+        .string()
+        .regex(/^[a-z][a-z0-9-]{0,31}$/)
+        .optional()
+        .describe(
+          "Permission profile (yolo, auto, or one from agentHost.sessionProfiles); defaults to yolo, for sessions the user creates directly. Fixed for the session's life",
+        ),
+      origin: originField('"automated"'),
+      launchedBySessionId: launchedByField,
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.send_prompt",
+    description: "Send a prompt to a session (provider-aware, streaming or await completion)",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      content: z.union([z.string(), z.array(z.unknown())]).describe("Prompt content"),
+      cwd: z.string().optional().describe("CWD for auto-resume"),
+      model: z.string().optional().describe("Model override for auto-resume"),
+      agent: z.string().optional().describe("Agent/provider (default: claude)"),
+      streaming: z.boolean().optional().default(true).describe("Stream events or await result"),
+      source: z
+        .string()
+        .optional()
+        .describe("Source for routing responses to an extension (e.g. myext/channel-1)"),
+    }),
+    execution: { lane: "long_running", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.interrupt_session",
+    description: "Interrupt current response",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.answer_modal",
+    description: "Answer a modal prompt the CLI is blocked on by pressing one of its option keys",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      // A string, not a number: this is a keystroke. The options happen to be
+      // digits today, but the TUI is free to render a lettered one.
+      key: z.string().describe('Option key to press, as rendered ("1", "2", ...)'),
+      fingerprint: z
+        .string()
+        .optional()
+        .describe("Fingerprint from the modal_prompt event — rejects answering a stale prompt"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.close_session",
+    description: "Close a session (kills CLI process via query.close())",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.list_sessions",
+    description: "List sessions for a workspace (DB-backed metadata, filesystem-enriched)",
+    inputSchema: z.object({
+      cwd: z.string().describe("Workspace CWD"),
+      limit: z
+        .number()
+        .optional()
+        .describe("Max sessions to return (omit for all). Sessions are sorted by modified desc."),
+      offset: z
+        .number()
+        .optional()
+        .default(0)
+        .describe("Number of sessions to skip from the front"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.search",
+    description:
+      "Find sessions by what was said in them — full-text over every user message and assistant prose, ranked by relevance. Tool inputs and outputs are not indexed.",
+    inputSchema: z.object({
+      query: z.string().describe("Free text; punctuation is tokenized, trailing word is a prefix"),
+      cwd: z.string().optional().describe("Restrict to one workspace (omit to search all)"),
+      ref: z
+        .string()
+        .optional()
+        .describe("Restrict to sessions carrying this PR/ticket key, e.g. 'anima#61'"),
+      disposition: z
+        .array(z.enum(["open", "needs_review", "blocked", "snoozed", "resolved", "archived"]))
+        .optional()
+        .describe(
+          "Restrict to these dispositions. Omitted searches all of them — unlike the nav, search deliberately reaches resolved and archived work, since finding it again is the point.",
+        ),
+      limit: z.number().int().positive().max(100).optional().default(20).describe("Max sessions"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.get_history",
+    description: "Get session history from JSONL",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      cwd: z.string().optional().describe("Workspace CWD for fast file lookup"),
+      limit: z.number().optional().default(50).describe("Max messages"),
+      before: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Return the page just before this message index (the `start` of the oldest page loaded). Omit for the latest page.",
+        ),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.switch_session",
+    description: "Switch active session for a workspace",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID to switch to"),
+      cwd: z.string().describe("Workspace CWD"),
+      model: z.string().optional().describe("Model override"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.reset_session",
+    description: "Create a replacement session for workspace",
+    inputSchema: z.object({
+      cwd: z.string().describe("Workspace CWD"),
+      model: z.string().optional().describe("Model to use"),
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.get_info",
+    description: "Get current session and extension info",
+    inputSchema: z.object({
+      sessionId: z.string().optional().describe("Session UUID (optional)"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.set_permission_mode",
+    description: "Set CLI permission mode",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      mode: z.string().describe("Permission mode"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.send_notification",
+    description:
+      "Inject a notification into a session as a user message wrapped in <user_notification> tags. " +
+      "Used by child agents/extensions to notify the session when background work completes.",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID to notify"),
+      text: z
+        .string()
+        .min(1)
+        .describe("Notification text (will be wrapped in <user_notification> tags)"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.send_tool_result",
+    description: "Send tool result for interactive tools",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      toolUseId: z.string().describe("Tool use ID"),
+      content: z.string().describe("Result content"),
+      isError: z.boolean().optional().default(false).describe("Is error result"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.spawn_agent",
+    description:
+      'Spawn a child agent session and send its initial prompt, or start a top-level session with parentSessionId "NEW"',
+    inputSchema: SpawnAgentSchema,
+    execution: { lane: "long_running", concurrency: "keyed", keyParam: "parentSessionId" },
+  },
+  {
+    name: "session.handoff",
+    description:
+      "Hand this session's work to a new one, instead of compacting: creates a session with the caller's settings, titles it, sends it the prompt, links the two, resolves the caller, and moves every client showing the caller to the new session. Returns the new sessionId without streaming. A session hands off once.",
+    inputSchema: handoffSchema,
+    execution: { lane: "long_running", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.get_subagent",
+    description: "Get child-agent session status by subagent ID",
+    inputSchema: GetSubagentSchema,
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.list_subagents",
+    description: "List child-agent sessions with optional filters",
+    inputSchema: ListSubagentsSchema,
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.interrupt_subagent",
+    description: "Interrupt a child-agent session by subagent ID",
+    inputSchema: InterruptSubagentSchema,
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.set_title",
+    description:
+      "Name a session explicitly. The reconciler never overwrites this — pass null to clear it and fall back to the derived title.",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      title: z
+        .string()
+        .max(200)
+        .nullable()
+        .describe("New name, or null to clear the rename and use the derived title"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.set_pinned",
+    description:
+      "Pin or unpin a session in the ACTIVE pane. Pinned sessions sort ahead of the rest, each group newest created first.",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      pinned: z.boolean().describe("True to pin, false to unpin"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.list_attention",
+    description:
+      "The work queue: every unresolved session across every workspace, pinned first, then newest created first. Not paginated per workspace — membership is the disposition, so nothing can be lost to a page boundary. Snoozed sessions are omitted until their timer passes. A resolved or archived session is not here at all, including the one a tab has open — it lives in its workspace tree, highlighted when current — until it gets a new prompt, which reopens it (as it does a snoozed one).",
+    inputSchema: z.object({
+      limit: z.number().int().positive().max(500).optional().default(200),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.resolve_stale",
+    description:
+      "Clear the ACTIVE queue: mark every unresolved session with no activity in N days as resolved. Safe because resolved sessions stay in the workspace tree — they leave the queue, not the sidebar. Reversible with set_status.",
+    inputSchema: z.object({
+      olderThanDays: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(5)
+        .describe("Resolve completed sessions with no activity in this many days"),
+      dryRun: z.boolean().optional().default(false).describe("Report what would change"),
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.snooze",
+    description:
+      "Hide a session from the attention list for a while, then let it come back. 'Remind me later', as distinct from 'we're done here' (which is set_status resolved).",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      minutes: z
+        .number()
+        .int()
+        .positive()
+        .max(1440)
+        .optional()
+        .default(30)
+        .describe("How long to stay quiet. Pass 0 via clear:true to un-snooze."),
+      clear: z.boolean().optional().default(false).describe("Cancel an existing snooze"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.set_status",
+    description:
+      "Set where a session's work stands. This is the human axis — separate from runtime status, which the agent owns. 'resolved' and 'archived' hide the session from the default list.",
+    inputSchema: z.object({
+      sessionId: z.string().describe("Session UUID"),
+      disposition: z
+        .enum(["open", "needs_review", "blocked", "snoozed", "resolved", "archived"])
+        .describe("Where the work stands"),
+    }),
+    execution: { lane: "write", concurrency: "keyed", keyParam: "sessionId" },
+  },
+  {
+    name: "session.backfill_refs",
+    description:
+      "Re-extract PR/ticket refs for recent sessions from their full transcripts (migration tool; the reconciler keeps up incrementally after this)",
+    inputSchema: z.object({
+      days: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(30)
+        .describe("How far back to look, by session last activity"),
+      rescan: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Re-read whole conversations instead of resuming from each session's watermark, and replace refs rather than merging. Use after changing ref config.",
+        ),
+      dryRun: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Report what would change without writing"),
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.validate_refs",
+    description:
+      "Check extracted GitHub PR/issue refs against the API, cache the verdicts, and remove the ones that don't exist. Invalid keys are remembered so they're never re-extracted.",
+    inputSchema: z.object({
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .default(50)
+        .describe("How many unchecked ref keys to validate this pass"),
+      revalidate: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Re-check keys that already have a cached verdict. Use after a repo is renamed or access changes.",
+        ),
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.list_workspaces",
+    description:
+      "List live workspaces, or with deleted:true only the deleted ones (most recent first). get_or_create_workspace on a deleted one's folder restores it.",
+    inputSchema: z.object({
+      deleted: z.boolean().optional().default(false).describe("List deleted workspaces instead"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.get_workspace",
+    description:
+      "Get a workspace by ID, with its folders (root first; kind root | worktree | added; inactiveAt set on a folder that moved or is gone)",
+    inputSchema: z.object({
+      id: z.string().describe("Workspace ID"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.set_workspace_pinned",
+    description: "Pin or unpin a workspace (pinned workspaces sort to the top)",
+    inputSchema: z.object({
+      id: z.string().describe("Workspace ID"),
+      pinned: z.boolean().describe("True to pin, false to unpin"),
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.update_workspace",
+    description:
+      "Set a workspace's project fields (description, aliases, GitHub repo) and folders (addFolder, removeFolder, setRoot, moveFolder; applied in that order, before the fields). Omitted fields are unchanged; null clears. detect: true fills githubRepo from the git origin remote when it isn't given. Returns the workspace, its folders, and notes on what each folder operation did.",
+    inputSchema: workspaceUpdateSchema,
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.find_workspace",
+    description:
+      "Resolve a project reference to its workspace: a name or alias, or a GitHub repo (owner/repo). Returns null unless exactly one workspace matches.",
+    inputSchema: workspaceFindSchema,
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.get_or_create_workspace",
+    description:
+      "Get or create workspace for CWD. A deleted workspace at that folder is restored, with its id, project fields and sessions.",
+    inputSchema: z.object({
+      cwd: z.string().describe("Working directory"),
+      name: z.string().optional().describe("Workspace name"),
+      general: z
+        .boolean()
+        .optional()
+        .describe("Mark workspace as general so archived summaries span all workspaces"),
+    }),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.delete_workspace",
+    description:
+      "Delete a workspace by id (preferred) or root folder. Soft: it's hidden (with its sessions) until get_or_create_workspace restores it. Returns the workspace it deleted",
+    inputSchema: z
+      .object({
+        id: z.string().optional().describe("Workspace ID; wins over cwd"),
+        cwd: z
+          .string()
+          .optional()
+          .describe(
+            "Root folder of the workspace to delete. The CLI fills this from the shell, so pass id to be sure",
+          ),
+      })
+      .refine((p) => p.id || p.cwd, "Pass id or cwd"),
+    execution: { lane: "write", concurrency: "serial" },
+  },
+  {
+    name: "session.get_directories",
+    description: "List child directories from a given path (for directory browsing)",
+    inputSchema: z.object({
+      path: z.string().optional().default("~").describe("Path to list directories from"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.list_commands",
+    description:
+      "List discoverable skills + slash commands (global ~/.claude + project <cwd>/.claude). Used by the web UI's `/` picker.",
+    inputSchema: z.object({
+      cwd: z
+        .string()
+        .optional()
+        .describe("Workspace cwd; if provided, project-local commands are merged in"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.list_files",
+    description:
+      "List files in a workspace cwd as relative paths. Uses `git ls-files` (respects .gitignore) when in a git repo, else walks while skipping heavy dirs (node_modules, .git, etc). Used by the web UI's `@` file picker.",
+    inputSchema: z.object({
+      cwd: z.string().describe("Workspace cwd to scan"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+  {
+    name: "session.health_check",
+    description: "Health status of session extension",
+    inputSchema: z.object({}),
+    execution: { lane: "control", concurrency: "parallel" },
+  },
+  {
+    name: "session.get_memory_context",
+    description:
+      "Preview the memory context that would be injected into a new session. Returns the raw formatted block and the underlying data. If cwd is omitted, uses the caller's working directory.",
+    inputSchema: z.object({
+      cwd: z
+        .string()
+        .optional()
+        .describe("Workspace directory (defaults to caller's working directory)"),
+    }),
+    execution: { lane: "read", concurrency: "parallel" },
+  },
+];

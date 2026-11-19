@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the watchdog, to run Anima at login.
+
+  Nothing fills this file in: `bun run watchdog:deploy` only compiles the watchdog to
+  <data folder>/bin/watchdog. Replace every /Users/alex path by hand (your home folder, and
+  WorkingDirectory = your checkout: the watchdog runs its services from its working folder),
+  save it as ~/Library/LaunchAgents/com.anima.watchdog.plist, then `launchctl load` it.
+
+  `anima watchdog install` writes a filled-in copy for you instead: the label from
+  ANIMA_WATCHDOG_LABEL, this checkout, your PATH, and the instance's ANIMA_* variables.
+  A second instance on the same machine needs its own Label (and file name).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.anima.watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/alex/.anima/bin/watchdog</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/alex/Projects/open-anima</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/alex/.local/bin:/Users/alex/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/alex</string>
+  </dict>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/alex/.anima/logs/watchdog-launchd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/alex/.anima/logs/watchdog-launchd.log</string>
+</dict>
+</plist>

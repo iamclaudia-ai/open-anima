@@ -1,0 +1,374 @@
+import { describe, expect, it } from "bun:test";
+import { EventEmitter } from "node:events";
+import { BACKGROUND_HOLD_MAX_MS } from "@anima/shared";
+import { SessionHost, type AgentRuntimeSession } from "./session-host";
+
+const YOLO = { name: "yolo", permissionMode: "bypassPermissions" };
+
+class FakeSession extends EventEmitter {
+  public isProcessRunning = false;
+  public lastActivityIso = new Date().toISOString();
+  public backgroundTasks: number | undefined = undefined;
+
+  constructor(
+    public id: string,
+    public isActive = true,
+  ) {
+    super();
+  }
+
+  async start(): Promise<void> {}
+
+  prompt(_content: string | unknown[]): void {}
+
+  interrupt(): void {}
+
+  setPermissionMode(_mode: string): void {}
+
+  sendToolResult(_toolUseId: string, _content: string, _isError = false): void {}
+
+  async close(): Promise<void> {
+    this.emit("closed");
+  }
+
+  getInfo() {
+    return {
+      id: this.id,
+      cwd: "/tmp/test",
+      model: "claude-test",
+      isActive: this.isActive,
+      isProcessRunning: this.isProcessRunning,
+      createdAt: new Date().toISOString(),
+      lastActivity: this.lastActivityIso,
+      healthy: true,
+      stale: false,
+      backgroundTasks: this.backgroundTasks,
+    };
+  }
+}
+
+/**
+ * A provider that implements the optional `release()` hook — i.e. one whose
+ * runtime outlives us (the CLI provider, whose tmux pane and `claude` process
+ * keep running after we let go).
+ */
+class ReleasableFakeSession extends FakeSession {
+  public released = false;
+  public closed = false;
+
+  async release(): Promise<void> {
+    this.released = true;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    this.emit("closed");
+  }
+}
+
+describe("SessionHost", () => {
+  it("cleans up event buffers when a session closes", async () => {
+    const fake = new FakeSession("s-cleanup");
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => fake as unknown as AgentRuntimeSession,
+          resume: () => fake as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+    fake.emit("sse", { type: "content_block_delta", delta: { text: "hi" } });
+
+    expect(host.getEventsAfter("s-cleanup", 0)).toHaveLength(1);
+
+    fake.emit("closed");
+    expect(host.getEventsAfter("s-cleanup", 0)).toEqual([]);
+  });
+
+  it("creates sessions with a caller-supplied session id", async () => {
+    const fake = new FakeSession("draft-session-1");
+    const created: Array<unknown> = [];
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: (options) => {
+            created.push(options);
+            return fake as unknown as AgentRuntimeSession;
+          },
+          resume: () => fake as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+
+    await host.create({
+      profile: "yolo",
+      sessionId: "draft-session-1",
+      cwd: "/repo",
+      model: "claude-opus-4-6",
+    });
+
+    expect(created).toEqual([
+      {
+        sessionId: "draft-session-1",
+        cwd: "/repo",
+        model: "claude-opus-4-6",
+        systemPrompt: undefined,
+        thinking: undefined,
+        effort: undefined,
+        profile: YOLO,
+      },
+    ]);
+  });
+
+  it("auto-resumes inactive sessions with defaults on prompt", async () => {
+    const resumed: Array<{ sessionId: string; options: unknown }> = [];
+    const fake = new FakeSession("s-resume");
+    let startCalls = 0;
+    fake.start = async () => {
+      startCalls += 1;
+    };
+
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => fake as unknown as AgentRuntimeSession,
+          resume: (sessionId, options) => {
+            resumed.push({ sessionId, options });
+            return fake as unknown as AgentRuntimeSession;
+          },
+        },
+      },
+    });
+
+    host.setDefaults({ model: "claude-opus-4-6", thinking: true, effort: "low" });
+    await host.prompt("s-resume", "hi", "/repo", undefined, undefined, "yolo");
+
+    expect(startCalls).toBe(1);
+    expect(resumed).toEqual([
+      {
+        sessionId: "s-resume",
+        options: {
+          cwd: "/repo",
+          model: "claude-opus-4-6",
+          thinking: true,
+          effort: "low",
+          profile: YOLO,
+        },
+      },
+    ]);
+  });
+
+  it("uses prompt model for auto-resume when provided", async () => {
+    const resumed: Array<{ sessionId: string; options: unknown }> = [];
+    const fake = new FakeSession("s-explicit-model");
+    let startCalls = 0;
+    fake.start = async () => {
+      startCalls += 1;
+    };
+
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => fake as unknown as AgentRuntimeSession,
+          resume: (sessionId, options) => {
+            resumed.push({ sessionId, options });
+            return fake as unknown as AgentRuntimeSession;
+          },
+        },
+      },
+    });
+
+    host.setDefaults({ model: "claude-sonnet-4-6", thinking: true, effort: "low" });
+    await host.prompt("s-explicit-model", "hi", "/repo", "claude-opus-4-6", undefined, "yolo");
+
+    expect(startCalls).toBe(1);
+    expect(resumed).toEqual([
+      {
+        sessionId: "s-explicit-model",
+        options: {
+          cwd: "/repo",
+          model: "claude-opus-4-6",
+          thinking: true,
+          effort: "low",
+          profile: YOLO,
+        },
+      },
+    ]);
+  });
+
+  it("reaps a stale session whose provider has no release(), via close()", async () => {
+    const stale = new FakeSession("s-stale");
+    stale.isProcessRunning = true;
+    stale.lastActivityIso = new Date(1_000).toISOString();
+
+    const fresh = new FakeSession("s-fresh");
+    fresh.isProcessRunning = true;
+    fresh.lastActivityIso = new Date(299_500).toISOString();
+
+    let createCalls = 0;
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => {
+            createCalls += 1;
+            return (createCalls === 1 ? stale : fresh) as unknown as AgentRuntimeSession;
+          },
+          resume: () => stale as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+
+    const closed = await host.reapIdleRunningSessions(300_000, 301_000);
+    expect(closed).toEqual(["s-stale"]);
+
+    expect(host.list().map((s) => (s as { id: string }).id)).toEqual(["s-fresh"]);
+  });
+
+  it("CLOSES an idle session even when the provider offers release()", async () => {
+    const stale = new ReleasableFakeSession("s-monitor");
+    stale.isProcessRunning = true;
+    stale.lastActivityIso = new Date(1_000).toISOString();
+
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => stale as unknown as AgentRuntimeSession,
+          resume: () => stale as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+    const reaped = await host.reapIdleRunningSessions(300_000, 301_000);
+
+    expect(reaped).toEqual(["s-monitor"]);
+    // Regression guard: releasing here would preserve the tmux pane and the
+    // `claude` process, and NOTHING ever collects them afterwards: the pane
+    // reaper skips any untracked pane whose process is alive, so they pile up
+    // for days. The idle reaper must close.
+    expect(stale.closed).toBe(true);
+    expect(stale.released).toBe(false);
+    expect(host.list()).toEqual([]);
+  });
+
+  it("keeps an idle session whose Monitor is still running, reaps one without", async () => {
+    const watching = new FakeSession("s-watching");
+    watching.isProcessRunning = true;
+    watching.lastActivityIso = new Date(1_000).toISOString();
+    watching.backgroundTasks = 1;
+    const done = new FakeSession("s-done");
+    done.isProcessRunning = true;
+    done.lastActivityIso = new Date(1_000).toISOString();
+    done.backgroundTasks = 0;
+
+    const queue = [watching, done];
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => queue.shift() as unknown as AgentRuntimeSession,
+          resume: () => watching as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+
+    expect(await host.reapIdleRunningSessions(300_000, 301_000)).toEqual(["s-done"]);
+    expect(host.list().map((s) => (s as { id: string }).id)).toEqual(["s-watching"]);
+
+    // Its Monitor ended: the next sweep reaps it.
+    watching.backgroundTasks = 0;
+    expect(await host.reapIdleRunningSessions(300_000, 302_000)).toEqual(["s-watching"]);
+  });
+
+  it("reaps a background-holding session after a day without a turn", async () => {
+    const stuck = new FakeSession("s-stuck");
+    stuck.isProcessRunning = true;
+    stuck.lastActivityIso = new Date(0).toISOString();
+    stuck.backgroundTasks = 2;
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => stuck as unknown as AgentRuntimeSession,
+          resume: () => stuck as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+    expect(await host.reapIdleRunningSessions(300_000, BACKGROUND_HOLD_MAX_MS)).toEqual([
+      "s-stuck",
+    ]);
+  });
+
+  it("persists only sessions with running SDK processes", async () => {
+    const running = new FakeSession("s-running");
+    running.isProcessRunning = true;
+
+    const idle = new FakeSession("s-idle");
+    idle.isProcessRunning = false;
+
+    let createCalls = 0;
+    const host = new SessionHost({
+      providers: {
+        claude: {
+          create: () => {
+            createCalls += 1;
+            return (createCalls === 1 ? running : idle) as unknown as AgentRuntimeSession;
+          },
+          resume: () => running as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+    await host.create({ profile: "yolo", cwd: "/repo", model: "claude-opus-4-6" });
+
+    const records = host.getSessionRecords();
+    expect(records.map((r) => r.id)).toEqual(["s-running"]);
+    expect(records.map((r) => r.agent)).toEqual(["claude"]);
+  });
+
+  it("routes sessions through the requested agent provider", async () => {
+    const fake = new FakeSession("alt-session");
+    fake.isProcessRunning = true;
+    const created: Array<unknown> = [];
+    const host = new SessionHost({
+      providers: {
+        alt: {
+          create: (options) => {
+            created.push(options);
+            return fake as unknown as AgentRuntimeSession;
+          },
+          resume: () => fake as unknown as AgentRuntimeSession,
+        },
+      },
+    });
+
+    await host.create({ profile: "yolo", agent: "alt", cwd: "/repo", model: "alt-model" });
+
+    expect(created).toEqual([
+      {
+        sessionId: undefined,
+        cwd: "/repo",
+        model: "alt-model",
+        systemPrompt: undefined,
+        thinking: undefined,
+        effort: undefined,
+        profile: YOLO,
+      },
+    ]);
+    expect(host.getSessionRecords().map((r) => r.agent)).toEqual(["alt"]);
+  });
+
+  it("rejects unsupported session agents", async () => {
+    const host = new SessionHost({ providers: {} });
+    await expect(
+      host.create({ profile: "yolo", agent: "missing", cwd: "/repo", model: "x" }),
+    ).rejects.toThrow("Unsupported session agent: missing");
+  });
+});

@@ -1,0 +1,715 @@
+import { describe, expect, it, spyOn } from "bun:test";
+import {
+  coerceValue,
+  exampleValueForSchema,
+  extractOutFlag,
+  formatFlagPlaceholder,
+  formatMethodCommand,
+  getNamespaces,
+  injectSessionIdFromEnv,
+  injectLauncherFromEnv,
+  matchesSchemaType,
+  parseCliParams,
+  printCliHelp,
+  printMethodExamples,
+  writeResultToFile,
+  printMethodHelp,
+  printMethodList,
+  printNamespaceHelp,
+  resolveSchema,
+  schemaType,
+  validateParamsAgainstSchema,
+  type JsonSchema,
+  type MethodCatalogEntry,
+} from "./index";
+
+describe("cli parsing", () => {
+  it("coerces booleans, numbers, null, and JSON", () => {
+    expect(coerceValue("true")).toBe(true);
+    expect(coerceValue("false")).toBe(false);
+    expect(coerceValue("null")).toBeNull();
+    expect(coerceValue("42")).toBe(42);
+    expect(coerceValue("3.5")).toBe(3.5);
+    expect(coerceValue('{"a":1}')).toEqual({ a: 1 });
+    expect(coerceValue("[1,2]")).toEqual([1, 2]);
+    expect(coerceValue("hello")).toBe("hello");
+  });
+
+  it("parses --flag value and --flag=value", () => {
+    const params = parseCliParams([
+      "--sessionId",
+      "ses_123",
+      "--thinking=true",
+      "--effort",
+      "medium",
+      "--verbose",
+    ]);
+
+    expect(params).toEqual({
+      sessionId: "ses_123",
+      thinking: true,
+      effort: "medium",
+      verbose: true,
+    });
+  });
+
+  /**
+   * Without the schema the parser has to guess from the text, and digits become
+   * a number. That's right for `--limit 50` and wrong for a string param whose
+   * value happens to be digits — `session.answer_modal --key 1` failed
+   * validation as "expected string, got number" before the parser could see
+   * that the method asked for a string.
+   */
+  describe("schema-aware coercion", () => {
+    const schema: JsonSchema = {
+      type: "object",
+      properties: {
+        key: { type: "string" },
+        limit: { type: "number" },
+        note: { type: "string" },
+      },
+    };
+
+    it("keeps a numeric-looking value as text when the param is a string", () => {
+      expect(parseCliParams(["--key", "1"], schema)).toEqual({ key: "1" });
+    });
+
+    it("does not round-trip through Number and lose precision", () => {
+      expect(parseCliParams(["--note", "1.50"], schema)).toEqual({ note: "1.50" });
+    });
+
+    it("still coerces params that are actually numbers", () => {
+      expect(parseCliParams(["--limit", "50"], schema)).toEqual({ limit: 50 });
+    });
+
+    it("guesses as before for params the schema doesn't mention", () => {
+      expect(parseCliParams(["--other", "7"], schema)).toEqual({ other: 7 });
+    });
+
+    it("leaves 'true' alone on a string param", () => {
+      expect(parseCliParams(["--key", "true"], schema)).toEqual({ key: "true" });
+    });
+  });
+
+  /**
+   * The schemas are camelCase because Zod is, but `--session-id` is the more
+   * natural thing to type at a shell. Both spell the same param, so the parser
+   * maps whatever was typed back onto the schema's own name.
+   */
+  describe("flag casing", () => {
+    const schema: JsonSchema = {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        maxTurns: { type: "number" },
+        permissionMode: { type: "string" },
+        action: {
+          type: "object",
+          properties: { targetName: { type: "string" } },
+        },
+        metadata: { type: "object" },
+      },
+    };
+
+    it.each([
+      ["--session-id", "kebab-case"],
+      ["--session_id", "snake_case"],
+      ["--sessionid", "all lower"],
+      ["--SessionId", "PascalCase"],
+      ["--SESSION_ID", "SCREAMING_SNAKE"],
+      ["--sessionId", "camelCase (unchanged)"],
+    ])("accepts %s (%s)", (flag) => {
+      expect(parseCliParams([flag, "ses_123"], schema)).toEqual({ sessionId: "ses_123" });
+    });
+
+    it("canonicalizes = syntax", () => {
+      expect(parseCliParams(["--max-turns=5"], schema)).toEqual({ maxTurns: 5 });
+    });
+
+    it("canonicalizes bare boolean flags", () => {
+      expect(parseCliParams(["--permission-mode"], schema)).toEqual({ permissionMode: true });
+    });
+
+    it("still applies string coercion rules to the canonical name", () => {
+      expect(parseCliParams(["--session-id", "1"], schema)).toEqual({ sessionId: "1" });
+    });
+
+    it("canonicalizes each segment of a dot path", () => {
+      expect(parseCliParams(["--action.target-name", "notify.send"], schema)).toEqual({
+        action: { targetName: "notify.send" },
+      });
+    });
+
+    it("leaves free-form object keys alone", () => {
+      expect(parseCliParams(["--metadata.my-key", "v"], schema)).toEqual({
+        metadata: { "my-key": "v" },
+      });
+    });
+
+    it("leaves an unknown param verbatim so the error names what was typed", () => {
+      expect(parseCliParams(["--not-a-param", "x"], schema)).toEqual({ "not-a-param": "x" });
+    });
+  });
+
+  it("throws on positional args", () => {
+    expect(() => parseCliParams(["oops"])).toThrow(
+      "Unexpected positional argument: oops. Use --name value.",
+    );
+  });
+
+  it("rejects invalid empty flag token", () => {
+    expect(() => parseCliParams(["--"])).toThrow("Invalid flag: --");
+  });
+
+  it("supports dot notation for nested objects", () => {
+    const params = parseCliParams([
+      "--name",
+      "My Task",
+      "--action.type",
+      "notification",
+      "--action.target",
+      "Hello world",
+    ]);
+    expect(params).toEqual({
+      name: "My Task",
+      action: { type: "notification", target: "Hello world" },
+    });
+  });
+
+  it("supports deeply nested dot notation", () => {
+    const params = parseCliParams([
+      "--action.type",
+      "extension_call",
+      "--action.target",
+      "notify.send",
+      "--action.payload.text",
+      "Hello from the scheduler",
+    ]);
+    expect(params).toEqual({
+      action: {
+        type: "extension_call",
+        target: "notify.send",
+        payload: { text: "Hello from the scheduler" },
+      },
+    });
+  });
+
+  it("supports dot notation with = syntax", () => {
+    const params = parseCliParams(["--action.type=notification"]);
+    expect(params).toEqual({ action: { type: "notification" } });
+  });
+});
+
+describe("schema resolution and validation", () => {
+  const sessionPromptSchema: JsonSchema = {
+    $ref: "#/definitions/session_send_prompt",
+    definitions: {
+      session_send_prompt: {
+        type: "object",
+        required: ["sessionId", "content", "model", "thinking", "effort"],
+        additionalProperties: false,
+        properties: {
+          sessionId: { type: "string" },
+          content: { anyOf: [{ type: "string" }, { type: "array" }] },
+          model: { type: "string" },
+          thinking: { type: "boolean" },
+          effort: { type: "string" },
+          verbose: { type: "boolean" },
+        },
+      },
+    },
+  };
+
+  it("resolves $ref definitions", () => {
+    const resolved = resolveSchema(sessionPromptSchema, sessionPromptSchema);
+    expect(resolved?.type).toBe("object");
+    expect(resolved?.required).toContain("sessionId");
+    expect(schemaType(resolved?.properties?.content, sessionPromptSchema)).toBe("string|array");
+  });
+
+  it("enforces required params and type checks", () => {
+    expect(() =>
+      validateParamsAgainstSchema("session.send_prompt", { sessionId: "s1" }, sessionPromptSchema),
+    ).toThrow("Missing required params for session.send_prompt: content, model, thinking, effort");
+
+    expect(() =>
+      validateParamsAgainstSchema(
+        "session.send_prompt",
+        {
+          sessionId: "s1",
+          content: "hello",
+          model: "claude-opus-4-6",
+          thinking: "true",
+          effort: "medium",
+        } as unknown as Record<string, unknown>,
+        sessionPromptSchema,
+      ),
+    ).toThrow("Invalid type for session.send_prompt.thinking: expected boolean, got string");
+
+    expect(() =>
+      validateParamsAgainstSchema(
+        "session.send_prompt",
+        {
+          sessionId: "s1",
+          content: "hello",
+          model: "claude-opus-4-6",
+          thinking: true,
+          effort: "medium",
+          extra: "x",
+        },
+        sessionPromptSchema,
+      ),
+    ).toThrow("Unknown params for session.send_prompt: extra");
+  });
+
+  it("rejects params a schema doesn't declare, even when it says nothing about extras", () => {
+    // Zod's input schemas omit additionalProperties entirely.
+    const silent: JsonSchema = { type: "object", properties: { cwd: { type: "string" } } };
+    expect(() =>
+      validateParamsAgainstSchema(
+        "session.delete_workspace",
+        { id: "ws-1", cwd: "/where/the/shell/is" },
+        silent,
+      ),
+    ).toThrow("Unknown params for session.delete_workspace: id (it takes cwd)");
+    expect(() =>
+      validateParamsAgainstSchema(
+        "gateway.list_methods",
+        { verbose: true },
+        { type: "object", properties: {} },
+      ),
+    ).toThrow("it takes no params");
+  });
+
+  it("lets a schema that opens itself take any extra params", () => {
+    for (const additionalProperties of [true, {}]) {
+      expect(() =>
+        validateParamsAgainstSchema(
+          "example.webhook",
+          { id: "d1", anything: "goes" },
+          { type: "object", properties: { id: { type: "string" } }, additionalProperties },
+        ),
+      ).not.toThrow();
+    }
+  });
+
+  it("accepts valid payload", () => {
+    expect(() =>
+      validateParamsAgainstSchema(
+        "session.send_prompt",
+        {
+          sessionId: "s1",
+          content: ["hello"],
+          model: "claude-opus-4-6",
+          thinking: true,
+          effort: "medium",
+        },
+        sessionPromptSchema,
+      ),
+    ).not.toThrow();
+  });
+
+  it("builds useful example values", () => {
+    expect(exampleValueForSchema({ type: "string" }, sessionPromptSchema)).toBe('"value"');
+    expect(exampleValueForSchema({ type: "boolean" }, sessionPromptSchema)).toBe("true");
+    expect(
+      exampleValueForSchema({ type: "array", items: { type: "string" } }, sessionPromptSchema),
+    ).toBe("'[\"value\"]'");
+  });
+
+  it("handles schema edge cases and additional primitive/object types", () => {
+    expect(resolveSchema({ $ref: "#/missing" }, sessionPromptSchema)).toEqual({
+      $ref: "#/missing",
+    });
+    expect(resolveSchema(undefined, sessionPromptSchema)).toBeUndefined();
+    expect(resolveSchema({ $ref: "#/definitions/session_send_prompt" }, undefined)).toEqual({
+      $ref: "#/definitions/session_send_prompt",
+    });
+
+    expect(schemaType({ allOf: [{ type: "string" }, { type: "number" }] })).toBe("string&number");
+    expect(schemaType(undefined)).toBe("unknown");
+
+    expect(matchesSchemaType(1, { type: "integer" }, sessionPromptSchema)).toBe(true);
+    expect(matchesSchemaType(1.5, { type: "integer" }, sessionPromptSchema)).toBe(false);
+    expect(matchesSchemaType(null, { type: "null" }, sessionPromptSchema)).toBe(true);
+    expect(matchesSchemaType({ a: 1 }, { type: "object" }, sessionPromptSchema)).toBe(true);
+    expect(
+      matchesSchemaType(
+        [1, 2],
+        { type: "array", items: [{ type: "number" }] },
+        sessionPromptSchema,
+      ),
+    ).toBe(true);
+    expect(
+      matchesSchemaType(
+        [1, "x"],
+        { type: "array", items: { type: "number" } },
+        sessionPromptSchema,
+      ),
+    ).toBe(false);
+
+    expect(exampleValueForSchema({ enum: ["alpha", "beta"] }, sessionPromptSchema)).toBe('"alpha"');
+    expect(
+      exampleValueForSchema({ type: "array", items: [{ type: "string" }] }, sessionPromptSchema),
+    ).toBe("'[]'");
+    expect(exampleValueForSchema({ type: "object" }, sessionPromptSchema)).toBe("'{}'");
+    expect(exampleValueForSchema({ type: "number" }, sessionPromptSchema)).toBe("1.23");
+    expect(exampleValueForSchema({ type: "integer" }, sessionPromptSchema)).toBe("1");
+    expect(exampleValueForSchema({ type: "null" }, sessionPromptSchema)).toBe("null");
+  });
+
+  it("resolves $ref with $defs (zodToJsonSchema style)", () => {
+    const zodSchema: JsonSchema = {
+      $ref: "#/$defs/SessionInput",
+      $defs: {
+        SessionInput: {
+          type: "object",
+          required: ["sessionId"],
+          properties: {
+            sessionId: { type: "string" },
+          },
+        },
+      },
+    };
+
+    const resolved = resolveSchema(zodSchema, zodSchema);
+    expect(resolved?.type).toBe("object");
+    expect(resolved?.required).toContain("sessionId");
+    expect(resolved?.properties?.sessionId?.type).toBe("string");
+  });
+});
+
+describe("sessionId auto-inject", () => {
+  const requiredSchema: JsonSchema = {
+    type: "object",
+    required: ["sessionId", "content"],
+    properties: {
+      sessionId: { type: "string" },
+      content: { type: "string" },
+    },
+  };
+
+  const optionalSchema: JsonSchema = {
+    type: "object",
+    properties: {
+      sessionId: { type: "string" },
+    },
+  };
+
+  it("auto-injects sessionId from env when required", () => {
+    const params: Record<string, unknown> = {};
+    const result = injectSessionIdFromEnv(
+      params,
+      { method: "session.send_prompt", source: "gateway", inputSchema: requiredSchema },
+      "session.send_prompt",
+      { ANIMA_SESSION_ID: "ses_123" },
+    );
+
+    expect(result.didInject).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(params.sessionId).toBe("ses_123");
+  });
+
+  it("errors when required sessionId is missing and env not set", () => {
+    const params: Record<string, unknown> = {};
+    const result = injectSessionIdFromEnv(
+      params,
+      { method: "session.send_prompt", source: "gateway", inputSchema: requiredSchema },
+      "session.send_prompt",
+      {},
+    );
+
+    expect(result.didInject).toBe(false);
+    expect(result.error).toBe(
+      "session.send_prompt requires --sessionId but $ANIMA_SESSION_ID is not set.",
+    );
+    expect(params.sessionId).toBeUndefined();
+  });
+
+  it("does nothing when sessionId is optional and env not set", () => {
+    const params: Record<string, unknown> = {};
+    const result = injectSessionIdFromEnv(
+      params,
+      { method: "session.send_prompt", source: "gateway", inputSchema: optionalSchema },
+      "session.send_prompt",
+      {},
+    );
+
+    expect(result.didInject).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(params.sessionId).toBeUndefined();
+  });
+
+  it("does not override explicit sessionId", () => {
+    const params: Record<string, unknown> = { sessionId: "ses_explicit" };
+    const result = injectSessionIdFromEnv(
+      params,
+      { method: "session.send_prompt", source: "gateway", inputSchema: requiredSchema },
+      "session.send_prompt",
+      { ANIMA_SESSION_ID: "ses_env" },
+    );
+
+    expect(result.didInject).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(params.sessionId).toBe("ses_explicit");
+  });
+});
+
+describe("injectLauncherFromEnv", () => {
+  const create: MethodCatalogEntry = {
+    method: "session.create_session",
+    source: "gateway",
+    inputSchema: {
+      type: "object",
+      properties: { cwd: { type: "string" }, launchedBySessionId: { type: "string" } },
+    },
+  };
+
+  it("fills the launcher from $ANIMA_SESSION_ID", () => {
+    const params: Record<string, unknown> = {};
+    expect(injectLauncherFromEnv(params, create, { ANIMA_SESSION_ID: "ses_launcher" })).toBe(true);
+    expect(params.launchedBySessionId).toBe("ses_launcher");
+  });
+
+  it("keeps an explicit launcher", () => {
+    const params: Record<string, unknown> = { launchedBySessionId: "ses_explicit" };
+    expect(injectLauncherFromEnv(params, create, { ANIMA_SESSION_ID: "ses_env" })).toBe(false);
+    expect(params.launchedBySessionId).toBe("ses_explicit");
+  });
+
+  it("injects nothing outside an Anima session", () => {
+    const params: Record<string, unknown> = {};
+    expect(injectLauncherFromEnv(params, create, {})).toBe(false);
+    expect(params.launchedBySessionId).toBeUndefined();
+  });
+
+  it("injects nothing into a method that doesn't take a launcher", () => {
+    const params: Record<string, unknown> = {};
+    const handoff: MethodCatalogEntry = {
+      method: "session.handoff",
+      source: "gateway",
+      inputSchema: { type: "object", properties: { sessionId: { type: "string" } } },
+    };
+    expect(injectLauncherFromEnv(params, handoff, { ANIMA_SESSION_ID: "ses_env" })).toBe(false);
+    expect(params.launchedBySessionId).toBeUndefined();
+  });
+});
+
+describe("help/example output", () => {
+  const entry: MethodCatalogEntry = {
+    method: "session.send_prompt",
+    source: "gateway",
+    description: "Send prompt",
+    inputSchema: {
+      $ref: "#/definitions/schema",
+      definitions: {
+        schema: {
+          type: "object",
+          required: ["sessionId", "content"],
+          properties: {
+            sessionId: { type: "string" },
+            content: { type: "string" },
+            verbose: { type: "boolean" },
+          },
+        },
+      },
+    },
+  };
+
+  const methods: MethodCatalogEntry[] = [
+    entry,
+    {
+      method: "browser.html",
+      source: "extension",
+      extensionId: "browser",
+      inputSchema: {
+        type: "object",
+        required: ["tab-id"],
+        properties: {
+          "tab-id": { type: "string" },
+          selector: { type: "string" },
+        },
+      },
+    },
+  ];
+
+  it("prints resolved help fields", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    printMethodHelp(entry);
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(lines.some((l) => l.includes("anima session send_prompt"))).toBe(true);
+    expect(lines.some((l) => l.includes("--sessionId <SESSIONID> (string, required)"))).toBe(true);
+    expect(lines.some((l) => l.includes("--verbose [VERBOSE] (boolean, optional)"))).toBe(true);
+
+    logSpy.mockRestore();
+  });
+
+  it("prints examples", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    printMethodExamples(entry);
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(
+      lines.some((l) =>
+        l.includes('anima session send_prompt --sessionId "value" --content "value"'),
+      ),
+    ).toBe(true);
+
+    logSpy.mockRestore();
+  });
+
+  it("prints top-level help with namespaces", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    printCliHelp(methods);
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(lines.some((l) => l.includes("Usage:"))).toBe(true);
+    expect(lines.some((l) => l.trim() === "browser")).toBe(true);
+    expect(lines.some((l) => l.trim() === "session")).toBe(true);
+
+    logSpy.mockRestore();
+  });
+
+  it("prints methods as space-separated commands with params", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    printMethodList(methods);
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(
+      lines.some((l) => l.includes("anima browser html --tab-id <TAB-ID> --selector [SELECTOR]")),
+    ).toBe(true);
+    expect(
+      lines.some((l) =>
+        l.includes(
+          "anima session send_prompt --sessionId <SESSIONID> --content <CONTENT> --verbose [VERBOSE]",
+        ),
+      ),
+    ).toBe(true);
+
+    logSpy.mockRestore();
+  });
+
+  it("prints namespace-only help", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    printNamespaceHelp("browser", methods);
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(lines.some((l) => l.includes("Namespace: browser"))).toBe(true);
+    expect(lines.some((l) => l.includes("anima browser html"))).toBe(true);
+    expect(lines.some((l) => l.includes("anima session send_prompt"))).toBe(false);
+
+    logSpy.mockRestore();
+  });
+
+  it("merges extension CLI commands into namespace help", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    const errSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    const cli = {
+      commands: {
+        run: { description: "Run it", usage: "<id>", run: async () => {} },
+      },
+    };
+
+    // Local commands alone make a namespace known, even with no gateway methods.
+    printNamespaceHelp("skills", [], cli);
+    // Alongside gateway methods, both sections are listed.
+    printNamespaceHelp("browser", methods, cli);
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(lines.some((l) => l.includes("anima skills run <id>  — Run it"))).toBe(true);
+    expect(lines.some((l) => l.includes("Gateway methods:"))).toBe(true);
+    expect(lines.some((l) => l.includes("anima browser html"))).toBe(true);
+    expect(errSpy).not.toHaveBeenCalled();
+
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+
+  it("prints fallbacks for unknown namespaces and methods", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
+    const errSpy = spyOn(console, "error").mockImplementation(() => undefined);
+
+    printNamespaceHelp("missing", methods);
+    printMethodList(methods, "missing");
+
+    expect(errSpy.mock.calls.flat().map(String)).toContain("Unknown namespace: missing");
+
+    expect(formatFlagPlaceholder("tab-id", true)).toBe("<TAB-ID>");
+    expect(formatFlagPlaceholder("verbose", false)).toBe("[VERBOSE]");
+    expect(formatMethodCommand({ method: "broken", source: "gateway" })).toBe("anima broken");
+    expect(getNamespaces(methods)).toEqual(["browser", "session"]);
+
+    printMethodHelp({ method: "gateway.health_check", source: "gateway" });
+    printMethodHelp({
+      method: "hooks.list",
+      source: "gateway",
+      inputSchema: { type: "object", properties: {} },
+    });
+    printMethodExamples({ method: "broken", source: "gateway", inputSchema: { type: "object" } });
+
+    const lines = logSpy.mock.calls.flat().map((v) => String(v));
+    expect(lines.some((l) => l.includes("No input schema available."))).toBe(true);
+    expect(lines.some((l) => l.includes("No parameters."))).toBe(true);
+    expect(lines.some((l) => l.includes("anima broken examples"))).toBe(true);
+
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+  });
+});
+
+describe("extractOutFlag", () => {
+  it("removes the flag and its value from the args", () => {
+    const result = extractOutFlag(["--tabId", "42", "--out", "shot.png"]);
+    expect(result.outPath).toBe("shot.png");
+    expect(result.args).toEqual(["--tabId", "42"]);
+  });
+
+  it("leaves args untouched when the flag is absent", () => {
+    const result = extractOutFlag(["--tabId", "42"]);
+    expect(result.outPath).toBeUndefined();
+    expect(result.args).toEqual(["--tabId", "42"]);
+  });
+
+  it("keeps args on both sides of the flag", () => {
+    const result = extractOutFlag(["--out", "a.png", "--fullPage", "true"]);
+    expect(result.outPath).toBe("a.png");
+    expect(result.args).toEqual(["--fullPage", "true"]);
+  });
+
+  it("rejects a missing path rather than swallowing the next flag", () => {
+    expect(() => extractOutFlag(["--out", "--fullPage"])).toThrow("--out requires a file path");
+    expect(() => extractOutFlag(["--out"])).toThrow("--out requires a file path");
+  });
+});
+
+describe("writeResultToFile", () => {
+  const tmp = (name: string) => `${process.env.TMPDIR || "/tmp"}/anima-cli-test-${name}`;
+
+  it("decodes a base64 data URI to real bytes", async () => {
+    // 1x1 transparent PNG.
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const path = tmp("shot.png");
+    const written = await writeResultToFile(`data:image/png;base64,${png}`, path);
+
+    expect(written.mediaType).toBe("image/png");
+    expect(written.bytes).toBe(Buffer.from(png, "base64").length);
+
+    // Real PNG magic bytes — proof it was decoded, not written as text.
+    const bytes = new Uint8Array(await Bun.file(path).arrayBuffer());
+    expect(Array.from(bytes.slice(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  it("writes a plain string unchanged", async () => {
+    const path = tmp("plain.txt");
+    await writeResultToFile("Example Domain", path);
+    expect(await Bun.file(path).text()).toBe("Example Domain");
+  });
+
+  it("writes an object as formatted JSON", async () => {
+    const path = tmp("obj.json");
+    await writeResultToFile({ tabId: 7 }, path);
+    expect(JSON.parse(await Bun.file(path).text())).toEqual({ tabId: 7 });
+  });
+});

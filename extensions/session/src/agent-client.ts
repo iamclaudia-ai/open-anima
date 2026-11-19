@@ -1,0 +1,499 @@
+/**
+ * Agent Host Client — WebSocket client for the agent-host server.
+ *
+ * Thin RPC client that translates session operations into WebSocket messages
+ * to the agent-host server. Replaces direct SessionManager usage when
+ * agent-host mode is enabled.
+ *
+ * Features:
+ * - Request/response RPC over WebSocket
+ * - Session event streaming (emits "session.event" for session lifecycle wiring)
+ * - Auto-reconnect with exponential backoff
+ * - Event replay on reconnection (gap-free streaming)
+ */
+
+import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
+import { animaLogFile, createLogger } from "@anima/shared";
+import type {
+  AgentHostClientMessage as ClientMessage,
+  AgentHostResponseMessage as ResponseMessage,
+  AgentHostSessionEventMessage as SessionEventMessage,
+} from "@anima/shared";
+
+const log = createLogger("AgentClient", animaLogFile("session.log"));
+
+// ── Types ────────────────────────────────────────────────────
+
+interface PendingRequest {
+  resolve: (payload: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+// ── AgentHostClient ──────────────────────────────────────────
+
+export class AgentHostClient extends EventEmitter {
+  private ws: WebSocket | null = null;
+  private pendingRequests = new Map<string, PendingRequest>();
+  private lastSeenSeq = new Map<string, number>();
+  /**
+   * Sessions this client wants events for, independent of how far it has read.
+   *
+   * `lastSeenSeq` can't answer that on its own: it's populated by *receiving*
+   * events, so a freshly-started process has an empty map, sends no
+   * `resumeSessions`, and ends up subscribed to nothing — while sessions it
+   * cares about run to completion without it. That's what stranded a spinner
+   * across every `watchdog reload` mid-turn: the CLI emitted `turn_stop`,
+   * agent-host had no subscriber to broadcast it to, and the row stayed
+   * `running` forever with no error anywhere.
+   */
+  private desiredSessions = new Set<string>();
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectBackoff: number;
+  private readonly initialReconnectBackoff: number;
+  private isConnecting = false;
+  private _isConnected = false;
+
+  private url: string;
+  private extensionId: string;
+
+  private static readonly REQUEST_TIMEOUT = 30_000;
+  private static readonly MAX_RECONNECT_BACKOFF = 10_000;
+
+  constructor(url: string, extensionId = "session", initialReconnectBackoff = 1000) {
+    super();
+    this.url = url;
+    this.extensionId = extensionId;
+    this.initialReconnectBackoff = initialReconnectBackoff;
+    this.reconnectBackoff = initialReconnectBackoff;
+  }
+
+  get isConnected(): boolean {
+    return this._isConnected;
+  }
+
+  // ── Connection Management ──────────────────────────────────
+
+  /**
+   * Connect to the agent-host server.
+   * Sends auth message with resume sessions for reconnection replay.
+   */
+  async connect(): Promise<void> {
+    if (this._isConnected || this.isConnecting) return;
+    this.isConnecting = true;
+
+    return new Promise<void>((resolve, reject) => {
+      try {
+        const ws = new WebSocket(this.url);
+
+        ws.onopen = () => {
+          this.ws = ws;
+          this._isConnected = true;
+          this.isConnecting = false;
+          this.reconnectBackoff = this.initialReconnectBackoff;
+
+          // Send auth with resume sessions
+          const resumeSessions = Array.from(this.lastSeenSeq.entries()).map(
+            ([sessionId, lastSeq]) => ({ sessionId, lastSeq }),
+          );
+          // Anything wanted but never read has no sequence to resume from, so
+          // it rides the no-replay path instead — asking for the whole buffer
+          // would re-deliver a turn's deltas into a chat that already has them.
+          const resubscribe = Array.from(this.desiredSessions).filter(
+            (id) => !this.lastSeenSeq.has(id),
+          );
+          const authMsg: ClientMessage = {
+            type: "auth",
+            extensionId: this.extensionId,
+            ...(resumeSessions.length > 0 ? { resumeSessions } : {}),
+          };
+
+          ws.send(JSON.stringify(authMsg));
+          if (resubscribe.length > 0) {
+            void this.subscribeSessions(resubscribe).catch(() => {
+              // Non-fatal: the next prompt on a session re-subscribes it
+              // anyway. Losing this only costs the events in between.
+            });
+          }
+          log.info("Connected to agent-host", {
+            url: this.url,
+            resumeSessions: resumeSessions.length,
+            resubscribed: resubscribe.length,
+          });
+          // Announced after auth, so a listener can reconcile which sessions it
+          // wants. This is the only signal for the case that has no other one:
+          // an initial connect that *failed* never ran the caller's startup
+          // subscription, and the reconnect that eventually succeeds has an
+          // empty `desiredSessions` with nothing to restore.
+          this.emit("connected");
+          resolve();
+        };
+
+        ws.onmessage = (event) => {
+          this.handleMessage(typeof event.data === "string" ? event.data : String(event.data));
+        };
+
+        ws.onclose = () => {
+          const wasConnected = this._isConnected;
+          const wasConnecting = this.isConnecting;
+          this._isConnected = false;
+          this.ws = null;
+          this.isConnecting = false;
+
+          if (wasConnecting && !wasConnected) {
+            // Socket closed before onopen fired — reject the caller's
+            // connect() promise AND kick off the same exponential-backoff
+            // retry path that mid-session disconnects use. Without this,
+            // a startup race where agent-host's WS isn't listening yet
+            // leaves the extension permanently disconnected.
+            reject(new Error(`Connection closed before open: ${this.url}`));
+            this.scheduleReconnect();
+          } else if (wasConnected) {
+            log.warn("Disconnected from agent-host, scheduling reconnect");
+            this.scheduleReconnect();
+          }
+        };
+
+        ws.onerror = (error) => {
+          log.error("WebSocket error", { error: String(error) });
+          if (this.isConnecting) {
+            this.isConnecting = false;
+            reject(new Error(`Failed to connect to agent-host at ${this.url}`));
+            this.scheduleReconnect();
+          }
+        };
+      } catch (error) {
+        this.isConnecting = false;
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Disconnect from the agent-host server.
+   */
+  disconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this._isConnected = false;
+
+    // Reject all pending requests
+    for (const [id, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Disconnected from agent-host"));
+      this.pendingRequests.delete(id);
+    }
+  }
+
+  // ── RPC Methods ────────────────────────────────────────────
+
+  /**
+   * Create a new session on the agent-host.
+   */
+  async createSession(params: {
+    sessionId?: string;
+    cwd: string;
+    model?: string;
+    systemPrompt?: string;
+    thinking?: boolean;
+    effort?: string;
+    agent?: string;
+    profile: string;
+  }): Promise<{ sessionId: string }> {
+    const result = await this.sendRequest({
+      type: "session.create",
+      requestId: "",
+      params,
+    });
+    return result as { sessionId: string };
+  }
+
+  /**
+   * Send a prompt to a session.
+   */
+  async prompt(
+    sessionId: string,
+    content: string | unknown[],
+    cwd: string | undefined,
+    model: string | undefined,
+    agent: string | undefined,
+    profile: string,
+  ): Promise<void> {
+    await this.sendRequest({
+      type: "session.prompt",
+      requestId: "",
+      sessionId,
+      content,
+      cwd,
+      model,
+      agent,
+      profile,
+    });
+  }
+
+  /**
+   * Interrupt a session.
+   */
+  async interrupt(sessionId: string): Promise<boolean> {
+    const result = (await this.sendRequest({
+      type: "session.interrupt",
+      requestId: "",
+      sessionId,
+    })) as { ok?: boolean } | undefined;
+    return result?.ok !== false;
+  }
+
+  /**
+   * Answer a modal prompt the CLI runtime is blocked on.
+   */
+  async answerModal(
+    sessionId: string,
+    key: string,
+    fingerprint?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const result = (await this.sendRequest({
+      type: "session.answer_modal",
+      requestId: "",
+      sessionId,
+      key,
+      fingerprint,
+    })) as { ok?: boolean; error?: string } | undefined;
+    return { ok: result?.ok !== false, error: result?.error };
+  }
+
+  /**
+   * Close a session.
+   */
+  async close(sessionId: string): Promise<void> {
+    await this.sendRequest({
+      type: "session.close",
+      requestId: "",
+      sessionId,
+    });
+    this.lastSeenSeq.delete(sessionId);
+    this.desiredSessions.delete(sessionId);
+  }
+
+  /**
+   * Subscribe to sessions without replaying their buffered events.
+   *
+   * Remembered, so a later reconnect restores the subscription rather than
+   * silently dropping back to nothing.
+   */
+  async subscribeSessions(sessionIds: string[]): Promise<void> {
+    for (const id of sessionIds) this.desiredSessions.add(id);
+    if (sessionIds.length === 0) return;
+    await this.sendRequest({
+      type: "session.subscribe",
+      requestId: "",
+      sessionIds,
+    });
+  }
+
+  /**
+   * List active sessions.
+   */
+  async list(): Promise<unknown[]> {
+    const result = await this.sendRequest({
+      type: "session.list",
+      requestId: "",
+    });
+    return (result as unknown[]) || [];
+  }
+
+  async spawnSubagent(params: {
+    parentSessionId: string;
+    subagentId?: string;
+    agent?: string;
+    prompt: string;
+    cwd?: string;
+    model?: string;
+    systemPrompt?: string;
+    thinking?: boolean;
+    effort?: string;
+    sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+    metadata?: Record<string, unknown>;
+    profile: string;
+  }): Promise<{
+    subagentId: string;
+    sessionId: string;
+    parentSessionId: string;
+    status: string;
+    message: string;
+  }> {
+    const result = await this.sendRequest({
+      type: "subagent.spawn",
+      requestId: "",
+      params,
+    });
+    return result as {
+      subagentId: string;
+      sessionId: string;
+      parentSessionId: string;
+      status: string;
+      message: string;
+    };
+  }
+
+  /**
+   * Set permission mode for a session.
+   */
+  async setPermissionMode(sessionId: string, mode: string): Promise<boolean> {
+    const result = (await this.sendRequest({
+      type: "session.set_permission_mode",
+      requestId: "",
+      sessionId,
+      mode,
+    })) as { ok?: boolean } | undefined;
+    return result?.ok !== false;
+  }
+
+  /**
+   * Send a tool result for an interactive tool.
+   */
+  async sendToolResult(
+    sessionId: string,
+    toolUseId: string,
+    content: string,
+    isError = false,
+  ): Promise<boolean> {
+    const result = (await this.sendRequest({
+      type: "session.send_tool_result",
+      requestId: "",
+      sessionId,
+      toolUseId,
+      content,
+      isError,
+    })) as { ok?: boolean } | undefined;
+    return result?.ok !== false;
+  }
+
+  /**
+   * Close all sessions (for extension shutdown).
+   */
+  async closeAll(): Promise<void> {
+    const sessions = await this.list();
+    for (const session of sessions) {
+      const id = (session as { id: string }).id;
+      if (id) {
+        await this.close(id).catch(() => {});
+      }
+    }
+  }
+
+  // ── Internal ───────────────────────────────────────────────
+
+  /**
+   * Send a request and await the response.
+   */
+  private sendRequest(msg: ClientMessage): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || !this._isConnected) {
+        reject(new Error("Not connected to agent-host"));
+        return;
+      }
+
+      const requestId = randomUUID();
+      // Override the placeholder requestId
+      const fullMsg = { ...msg, requestId };
+
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(requestId);
+        reject(new Error(`Request timed out: ${msg.type}`));
+      }, AgentHostClient.REQUEST_TIMEOUT);
+
+      this.pendingRequests.set(requestId, { resolve, reject, timer });
+      this.ws.send(JSON.stringify(fullMsg));
+    });
+  }
+
+  /**
+   * Handle an incoming WebSocket message.
+   */
+  private handleMessage(raw: string): void {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      log.warn("Invalid JSON from agent-host", { raw: raw.slice(0, 100) });
+      return;
+    }
+
+    if (msg.type === "res") {
+      this.handleResponse(msg as unknown as ResponseMessage);
+    } else if (msg.type === "session.event") {
+      this.handleSessionEvent(msg as unknown as SessionEventMessage);
+    }
+  }
+
+  /**
+   * Handle a response to a pending request.
+   */
+  private handleResponse(msg: ResponseMessage): void {
+    const pending = this.pendingRequests.get(msg.requestId);
+    if (!pending) return;
+
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(msg.requestId);
+
+    if (msg.ok) {
+      pending.resolve(msg.payload);
+    } else {
+      pending.reject(new Error(msg.error || "Request failed"));
+    }
+  }
+
+  /**
+   * Handle a streaming session event.
+   * Updates lastSeenSeq and emits "session.event" in the format expected by
+   * the session extension's event wiring.
+   */
+  private handleSessionEvent(msg: SessionEventMessage): void {
+    // Track sequence for reconnection replay
+    this.lastSeenSeq.set(msg.sessionId, msg.seq);
+    // An event arriving is proof this session matters to us — agent-host only
+    // sends for subscribed ones, and the subscription may have been created by
+    // a prompt rather than by us asking. Recording it here is what lets a
+    // reconnect put it back.
+    this.desiredSessions.add(msg.sessionId);
+
+    // Emit in the same format as the session extension's event bridge expects.
+    this.emit("session.event", {
+      eventName: `session.${msg.sessionId}.${msg.event.type}`,
+      sessionId: msg.sessionId,
+      ...msg.event,
+    });
+  }
+
+  /**
+   * Schedule a reconnection attempt with exponential backoff.
+   */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      log.info("Attempting reconnection", { backoff: this.reconnectBackoff });
+
+      try {
+        await this.connect();
+        log.info("Reconnected to agent-host");
+      } catch {
+        this.reconnectBackoff = Math.min(
+          this.reconnectBackoff * 2,
+          AgentHostClient.MAX_RECONNECT_BACKOFF,
+        );
+        this.scheduleReconnect();
+      }
+    }, this.reconnectBackoff);
+  }
+}

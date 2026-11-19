@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+
+tmp/
+
+# Build output
+dist/
+*.tsbuildinfo
+.web-vendor-entries/
+
+# Bun
+bun.lockb
+
+# IDE
+.idea/
+.vscode/*.local.json
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/**
+
+# iOS/Xcode build artifacts
+clients/ios/build/
+clients/ios/.build/
+clients/ios/ios/build/
+clients/ios/android/build/
+clients/ios/android/.gradle/
+clients/**/build/
+
+# Anima data
+.anima/
+
+# Config (contains secrets - use anima.example.json as template)
+anima.json

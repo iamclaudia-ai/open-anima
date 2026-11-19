@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# check-review-queue: PRs waiting on YOUR review (the `gh` user), one GraphQL search per section:
+#   🔔 Requested   You're a requested reviewer. GitHub drops you once you submit a review, so
+#                  being listed again after reviewing means the author re-requested you.
+#   👥 Team        Requested from a team you're on, not from you directly. Counted but not listed
+#                  unless --team or --all: team membership is too broad to mean "you, review this".
+#   🔁 Follow-up   You reviewed, nobody re-requested you, but there are new commits since your
+#                  latest review, or someone replied last on a thread you started.
+# Follow-ups come first: they're PRs you already know.
+# Drafts and PRs a human has approved are counted but not listed (--all shows them). Bot
+# approvals don't count, and a direct re-request always shows: the author asked you again.
+# PRs idle longer than --days (default 30) are counted but not listed.
+# --quiet N hides PR N until it's updated after the moment it was quieted; --unquiet N undoes it.
+# --json prints the listed rows as a JSON array and exits, leaving the ● cache alone
+# (Anima's /today board polls it; it mustn't swallow the "new since last check" markers).
+# Each JSON row also carries its branches, `parent` and `stack` (see the --json block),
+# so a review stack can be worked in one worktree by one session.
+#
+# Read-only: it never posts to or acts on a PR. Needs gh (authenticated), jq and bash.
+# Bundled with Anima's Today extension (extensions/today/tools); usable on its own too.
+#
+# Cache stored in .git/review-queue-cache.json (powers the ● "new since last check" marker).
+
+set -euo pipefail
+
+JSON=false
+SHOW_ALL=false
+SHOW_TEAM=false
+REPO=""
+MAX_AGE_DAYS=30
+QUIET=()
+UNQUIET=()
+
+usage() {
+  echo "Usage: $(basename "$0") [--json] [--all|-a] [--team|-t] [--days|-d N] [--repo|-R owner/repo] [--quiet|-q PR]... [--unquiet|-u PR]..."
+  exit 1
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=true ;;
+    --all|-a) SHOW_ALL=true ;;
+    --team|-t) SHOW_TEAM=true ;;
+    --days|-d) MAX_AGE_DAYS="${2:-}"; [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]] || usage; shift ;;
+    --repo|-R) REPO="${2:-}"; [ -z "$REPO" ] && usage; shift ;;
+    --quiet|-q) [[ "${2:-}" =~ ^#?[0-9]+$ ]] || usage; QUIET+=("${2#\#}"); shift ;;
+    --unquiet|-u) [[ "${2:-}" =~ ^#?[0-9]+$ ]] || usage; UNQUIET+=("${2#\#}"); shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+GRAY='\033[0;90m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+[ -z "$REPO" ] && REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+ME=$(gh api user --jq .login)
+
+CACHE_FILE=".git/review-queue-cache.json"
+QUIET_FILE=".git/review-queue-quiet.json"
+if [ ! -d .git ]; then
+  CACHE_FILE="${TMPDIR:-/tmp}/review-queue-cache.json"
+  QUIET_FILE="$HOME/.review-queue-quiet.json"
+fi
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+cached='{}'
+if [ -f "$CACHE_FILE" ] && jq -e 'type == "object"' "$CACHE_FILE" > /dev/null 2>&1; then
+  cached=$(cat "$CACHE_FILE")
+fi
+echo "$cached" > "$tmpdir/cached.json"
+
+# Quiet list: "owner/repo#N" → when it was quieted. Keyed by repo because the
+# outside-a-repo fallback file is shared.
+quiet='{}'
+if [ -f "$QUIET_FILE" ] && jq -e 'type == "object"' "$QUIET_FILE" > /dev/null 2>&1; then
+  quiet=$(cat "$QUIET_FILE")
+fi
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+for number in ${QUIET[@]+"${QUIET[@]}"}; do
+  quiet=$(jq --arg key "$REPO#$number" --arg now "$now" '.[$key] = $now' <<< "$quiet")
+  echo -e "${GRAY}🔕 Quieted #${number} until it's updated${NC}"
+done
+for number in ${UNQUIET[@]+"${UNQUIET[@]}"}; do
+  quiet=$(jq --arg key "$REPO#$number" 'del(.[$key])' <<< "$quiet")
+  echo -e "${GRAY}🔔 Unquieted #${number}${NC}"
+done
+[ $(( ${#QUIET[@]} + ${#UNQUIET[@]} )) -gt 0 ] && echo ""
+
+QUERY='
+query($q: String!, $n: Int!) {
+  search(query: $q, type: ISSUE, first: $n) {
+    nodes {
+      ... on PullRequest {
+        number title url isDraft updatedAt createdAt headRefName baseRefName
+        author { login }
+        baseRepository { defaultBranchRef { name } }
+        reviewRequests(first: 20) {
+          nodes { requestedReviewer { ... on User { login } ... on Team { slug } } }
+        }
+        reviews(last: 50) { nodes { author { login } state submittedAt commit { oid } } }
+        latestOpinionatedReviews(first: 20) { nodes { state author { __typename login } } }
+        commits(last: 1) { nodes { commit { oid } } }
+        reviewThreads(first: 50) {
+          nodes {
+            isResolved
+            first: comments(first: 1) { nodes { author { login } } }
+            last: comments(last: 1) { nodes { author { login } } }
+          }
+        }
+      }
+    }
+  }
+}'
+
+# GitHub prices a query by the page sizes it asks for, not what comes back: at first: 50
+# each search cost 53 of the 5,000 GraphQL points an hour, even for an empty queue (Anima's
+# /today polls this). So count first (1 point) and ask for exactly that many; nothing to
+# list skips the big query.
+search() {
+  local q="$1" out="$2" count n
+  count=$(gh api graphql -f q="$q" \
+    -f query='query($q: String!) { search(query: $q, type: ISSUE, first: 1) { issueCount } }' \
+    --jq .data.search.issueCount)
+  if [ "$count" -eq 0 ]; then
+    echo '{"data":{"search":{"nodes":[]}}}' > "$out"
+    return
+  fi
+  n=$(( count > 50 ? 50 : count ))
+  gh api graphql -f query="$QUERY" -f q="$q" -F n="$n" > "$out"
+}
+
+# Both searches run in parallel.
+search "repo:$REPO is:pr is:open review-requested:$ME archived:false" "$tmpdir/requested.json" &
+requested_pid=$!
+search "repo:$REPO is:pr is:open reviewed-by:$ME -author:$ME -review-requested:$ME archived:false" \
+  "$tmpdir/reviewed.json" &
+reviewed_pid=$!
+wait "$requested_pid" && wait "$reviewed_pid" || { echo "check-review-queue: GitHub search failed" >&2; exit 1; }
+
+# One row per PR, annotated with everything the display needs. `reviewDecision` can't
+# stand in for `approvedBy`: it counts approvals from an AI review bot as APPROVED.
+rows=$(jq -n --arg me "$ME" --arg repo "$REPO" --argjson quiet "$quiet" \
+  --slurpfile requested "$tmpdir/requested.json" \
+  --slurpfile reviewed "$tmpdir/reviewed.json" '
+  def annotate($section):
+    ([.reviews.nodes[] | select(.author.login == $me)] | max_by(.submittedAt)) as $mine
+    | any(.reviewRequests.nodes[].requestedReviewer; .login == $me) as $direct
+    | [.latestOpinionatedReviews.nodes[]
+        | select(.state == "APPROVED" and .author.__typename != "Bot")
+        | .author.login] as $approvedBy
+    | {
+        section: (if $section == "requested" and ($direct | not) then "team" else $section end),
+        number, title, url, isDraft, updatedAt, createdAt, headRefName, baseRefName,
+        defaultBranch: .baseRepository.defaultBranchRef.name,
+        author: .author.login,
+        direct: $direct,
+        approvedBy: $approvedBy,
+        quietedAt: $quiet["\($repo)#\(.number)"],
+        hidden: (if .isDraft then "draft"
+                 elif ($approvedBy | length) > 0 and (($direct and $mine != null) | not) then "approved"
+                 else null end),
+        lastState: ($mine.state // null),
+        lastReviewedAt: ($mine.submittedAt // null),
+        pushedSince: ($mine != null and .commits.nodes[0].commit.oid != $mine.commit.oid),
+        replies: [.reviewThreads.nodes[]
+          | select(.isResolved | not)
+          | select(.first.nodes[0].author.login == $me and .last.nodes[0].author.login != $me)]
+          | length,
+        ageDays: ((now - (.updatedAt | fromdate)) / 86400 | floor)
+      };
+  [($requested[0].data.search.nodes[] | annotate("requested")),
+   ($reviewed[0].data.search.nodes[] | annotate("followup")
+      | select(.pushedSince or .replies > 0))]
+')
+stale_count=$(jq --argjson max "$MAX_AGE_DAYS" '[.[] | select(.ageDays > $max)] | length' <<< "$rows")
+rows=$(jq --argjson max "$MAX_AGE_DAYS" '[.[] | select(.ageDays <= $max)]' <<< "$rows")
+# A PR updated after it was quieted comes back, and its entry is dropped.
+rows=$(jq '[.[] | if .quietedAt != null and .updatedAt <= .quietedAt and .hidden == null
+                  then .hidden = "quiet" else . end]' <<< "$rows")
+quiet=$(jq --arg repo "$REPO" --argjson rows "$rows" '
+  with_entries(select(.key as $key
+    | ($rows | map(select("\($repo)#\(.number)" == $key and .updatedAt > .quietedAt)) | length) == 0))' <<< "$quiet")
+echo "$quiet" > "$QUIET_FILE"
+
+quiet_count=$(jq '[.[] | select(.hidden == "quiet")] | length' <<< "$rows")
+draft_count=$(jq '[.[] | select(.hidden == "draft")] | length' <<< "$rows")
+approved_count=$(jq '[.[] | select(.hidden == "approved")] | length' <<< "$rows")
+[ "$SHOW_ALL" = true ] || rows=$(jq '[.[] | select(.hidden == null)]' <<< "$rows")
+if [ "$JSON" = true ]; then
+  # Stacks. A queue PR can sit on PRs that aren't in the queue (already approved, or not
+  # requested from me), and the session reviewing it has to check those out too. So each
+  # author's open PRs come in with one more search apiece, and each row gets:
+  #   parent  the open PR whose head is this PR's base; null on the default branch
+  #   stack   every PR in its stack, bottom first, with inQueue marking the ones listed
+  #           here; null when the PR stands alone. Same array on every member, so
+  #           consumers group by stack[0].number.
+  # Stacks never cross authors here: a teammate building on someone else's PR is rare.
+  STACK_QUERY='
+  query($q: String!) {
+    search(query: $q, type: ISSUE, first: 100) {
+      nodes {
+        ... on PullRequest {
+          number title url isDraft headRefName baseRefName
+          author { login }
+          baseRepository { defaultBranchRef { name } }
+        }
+      }
+    }
+  }'
+  i=0
+  while IFS= read -r author; do
+    [ -z "$author" ] && continue
+    gh api graphql -f query="$STACK_QUERY" \
+      -f q="repo:$REPO is:pr is:open author:$author archived:false" > "$tmpdir/stack-$i.json" &
+    i=$((i + 1))
+  done < <(jq -r '[.[].author] | unique | .[]' <<< "$rows")
+  wait
+  jq -s '[.[].data.search.nodes[]]' "$tmpdir"/stack-*.json 2> /dev/null > "$tmpdir/context.json" \
+    || echo '[]' > "$tmpdir/context.json"
+
+  jq --arg repo "$REPO" --slurpfile context "$tmpdir/context.json" '
+    . as $rows
+    | ($rows | map(.number)) as $queued
+    | ([$context[0][] | {number, title, url, isDraft, headRefName, baseRefName,
+                         author: .author.login,
+                         defaultBranch: .baseRepository.defaultBranchRef.name}]
+       + [$rows[] | {number, title, url, isDraft, headRefName, baseRefName, author, defaultBranch}]
+       | unique_by(.number)) as $open
+    | ($open | map({key: .headRefName, value: .number}) | from_entries) as $by_head
+    | ($open | map(. + {parent: (if .baseRefName == .defaultBranch then null
+                                   else $by_head[.baseRefName] end)})) as $open
+    | ($open | map({key: (.number | tostring), value: .}) | from_entries) as $by_number
+    # The bottom of the stack a PR is in, and how far above it the PR sits. The depth cap
+    # only guards against a cycle, which GitHub cannot make.
+    | def bottom($pr; $depth):
+        ($pr.parent | if . == null then null else $by_number[tostring] end) as $below
+        | if $below == null or $depth > 20 then {root: $pr.number, depth: $depth}
+          else bottom($below; $depth + 1) end;
+      ($open | map(. + bottom(.; 0) + {inQueue: (.number as $n | $queued | index($n) != null)})
+       | group_by(.root)
+       | map(select(length > 1) | sort_by(.depth, .number)
+             | map({number, title, url, author, isDraft, headRefName, baseRefName, parent, inQueue})))
+      as $stacks
+    | [$rows[] | .number as $n
+        | .repo = $repo
+        | .parent = $by_number[$n | tostring].parent
+        | .stack = (first($stacks[] | select(any(.[]; .number == $n))) // null)]
+  ' <<< "$rows"
+  exit 0
+fi
+echo "$rows" > "$tmpdir/rows.json"
+
+# Cache: PR number → updatedAt, so a PR that moved since the last run gets a ●.
+jq '[.[] | {key: (.number | tostring), value: .updatedAt}] | from_entries' "$tmpdir/rows.json" > "$CACHE_FILE"
+
+age() {
+  local days=$1
+  if [ "$days" -eq 0 ]; then echo "today"
+  elif [ "$days" -eq 1 ]; then echo "1 day ago"
+  else echo "$days days ago"
+  fi
+}
+
+print_pr() {
+  local row=$1 detail=$2
+  local number title url author is_draft approved updated days marker="" draft=""
+  number=$(jq -r '.number' <<< "$row")
+  title=$(jq -r '.title' <<< "$row")
+  url=$(jq -r '.url' <<< "$row")
+  author=$(jq -r '.author' <<< "$row")
+  is_draft=$(jq -r '.isDraft' <<< "$row")
+  updated=$(jq -r '.updatedAt' <<< "$row")
+  days=$(jq -r '.ageDays' <<< "$row")
+
+  if [ "$(jq -r --arg n "$number" '.[$n] // ""' "$tmpdir/cached.json")" != "$updated" ]; then
+    marker=" ${YELLOW}●${NC}"
+  fi
+  [ "$is_draft" = "true" ] && draft=" ${GRAY}(draft)${NC}"
+  approved=$(jq -r '.approvedBy | map("@" + .) | join(", ")' <<< "$row")
+  [ -n "$approved" ] && draft="${draft} ${GRAY}(approved by ${approved})${NC}"
+  [ "$(jq -r '.hidden' <<< "$row")" = "quiet" ] && draft="${draft} ${GRAY}(quieted)${NC}"
+
+  echo -e "   #${number}: ${title:0:70}${draft}${marker}"
+  echo -e "      ${detail}  ${GRAY}│  @${author}  │  updated $(age "$days")${NC}"
+  echo -e "      ${GRAY}${url}${NC}"
+}
+
+direct=$(jq -c '[.[] | select(.section == "requested")] | sort_by(.updatedAt) | reverse | .[]' "$tmpdir/rows.json")
+team=$(jq -c '[.[] | select(.section == "team")] | sort_by(.updatedAt) | reverse | .[]' "$tmpdir/rows.json")
+followup=$(jq -c '[.[] | select(.section == "followup")] | sort_by(.updatedAt) | reverse | .[]' "$tmpdir/rows.json")
+
+count() { [ -z "$1" ] && echo 0 || echo "$1" | wc -l | tr -d ' '; }
+direct_count=$(count "$direct")
+team_count=$(count "$team")
+team_hidden_count=0
+if [ "$SHOW_ALL" = false ] && [ "$SHOW_TEAM" = false ]; then
+  team_hidden_count=$team_count
+  team=""
+  team_count=0
+fi
+followup_count=$(count "$followup")
+
+team_summary=""
+[ "$team_count" -gt 0 ] && team_summary=", ${team_count} team"
+echo -e "${BOLD}📥 Review Queue${NC}  ${GRAY}(${REPO}: ${followup_count} follow-up, ${direct_count} requested${team_summary})${NC}"
+echo ""
+
+if [ "$direct_count" -eq 0 ] && [ "$team_count" -eq 0 ] && [ "$followup_count" -eq 0 ]; then
+  echo -e "${GREEN}Nothing waiting on you. 🎉${NC}"
+  echo ""
+fi
+
+if [ "$followup_count" -gt 0 ]; then
+  echo -e "${CYAN}🔁 Follow-up${NC}  ${GRAY}(you reviewed, not re-requested)${NC}"
+  echo ""
+  while IFS= read -r row; do
+    parts=()
+    [ "$(jq -r '.pushedSince' <<< "$row")" = "true" ] && parts+=("📦 New commits")
+    replies=$(jq -r '.replies' <<< "$row")
+    [ "$replies" -eq 1 ] && parts+=("💬 1 reply")
+    [ "$replies" -gt 1 ] && parts+=("💬 ${replies} replies")
+    state=$(jq -r '.lastState | ascii_downcase | gsub("_"; " ")' <<< "$row")
+    detail="$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g') since your ${state} review"
+    print_pr "$row" "$detail"
+    echo ""
+  done <<< "$followup"
+fi
+
+if [ "$direct_count" -gt 0 ]; then
+  echo -e "${CYAN}🔔 Review requested${NC}"
+  echo ""
+  while IFS= read -r row; do
+    if [ "$(jq -r '.lastState' <<< "$row")" != "null" ]; then
+      detail="🔁 Re-requested after your $(jq -r '.lastState | ascii_downcase | gsub("_"; " ")' <<< "$row") review"
+    else
+      detail="👀 New request"
+    fi
+    print_pr "$row" "$detail"
+    echo ""
+  done <<< "$direct"
+fi
+
+if [ "$team_count" -gt 0 ]; then
+  echo -e "${CYAN}👥 Team requests${NC}"
+  echo ""
+  while IFS= read -r row; do
+    print_pr "$row" "👥 Requested from a team you're on"
+    echo ""
+  done <<< "$team"
+fi
+
+if [ "$SHOW_ALL" = false ] && [ $((quiet_count + draft_count + approved_count + team_hidden_count)) -gt 0 ]; then
+  hidden=()
+  [ "$quiet_count" -gt 0 ] && hidden+=("${quiet_count} quieted")
+  [ "$draft_count" -gt 0 ] && hidden+=("${draft_count} draft")
+  [ "$approved_count" -gt 0 ] && hidden+=("${approved_count} approved")
+  [ "$team_hidden_count" -eq 1 ] && hidden+=("1 team request")
+  [ "$team_hidden_count" -gt 1 ] && hidden+=("${team_hidden_count} team requests")
+  echo -e "${GRAY}🙈 $(IFS=,; echo "${hidden[*]}" | sed 's/,/, /g') hidden (--all to show)${NC}"
+  echo ""
+fi
+
+if [ "$stale_count" -gt 0 ]; then
+  echo -e "${GRAY}💤 ${stale_count} idle for more than ${MAX_AGE_DAYS} days hidden (--days N to widen)${NC}"
+  echo ""
+fi
+
+echo -e "${GRAY}────────────────────────────────────────${NC}"
+echo -e "${GRAY}${YELLOW}●${GRAY} = updated since last check  │  Cache: ${CACHE_FILE}${NC}"
