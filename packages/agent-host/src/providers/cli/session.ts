@@ -81,6 +81,7 @@ import { claudePaneName } from "../../pane-names";
 import { CLAUDE_FOR_FOLDER, resolveClaudeAccount } from "./claude-account";
 import { BUILTIN_PROFILES, LEGACY_PROFILE, type ResolvedProfile } from "../../profiles";
 import { type ExtensionMcpTarget, profileCliArgs, writeSessionMcpConfig } from "./profile-args";
+import { systemPromptArgs, writeSessionPromptFile } from "./system-prompt-args";
 
 const log = createLogger("ClaudeCliSession", animaLogFile("agent-host.log"));
 
@@ -652,21 +653,14 @@ export class ClaudeCliSession extends EventEmitter {
         : undefined;
     args.push("--model", this.cliModel, ...profileCliArgs(this.profile, mcpConfigPath));
     if (this.config.hookSettingsPath) args.push("--settings", this.config.hookSettingsPath);
-    // Persona file first: in "replace" mode it swaps out Claude Code's own
-    // system prompt, so it must not clobber the per-session context below.
-    const personaFile = this.resolveSystemPromptFile();
-    if (personaFile) {
-      const flag =
-        this.config.systemPromptMode === "replace"
-          ? "--system-prompt-file"
-          : "--append-system-prompt-file";
-      args.push(flag, personaFile);
-    }
-    // Per-session context (memory bootstrap + time reminder) always appends,
-    // whichever mode the persona uses.
-    if (this.systemPrompt && this.systemPrompt.trim()) {
-      args.push("--append-system-prompt", this.systemPrompt.trim());
-    }
+    args.push(
+      ...systemPromptArgs({
+        personaFile: this.resolveSystemPromptFile(),
+        mode: this.config.systemPromptMode,
+        context: this.systemPrompt,
+        writeMerged: (text) => writeSessionPromptFile(this.id, text),
+      }),
+    );
     // Force the subscription OAuth path: clear any API-key vars. Then route the
     // CLI at our proxy per transport — base-url points ANTHROPIC_BASE_URL at the
     // origin; mitm sets HTTPS_PROXY + a trusted CA and leaves the base URL unset
@@ -685,6 +679,9 @@ export class ClaudeCliSession extends EventEmitter {
       env.ANTHROPIC_BASE_URL = ""; // clear any inherited base url
     } else {
       env.ANTHROPIC_BASE_URL = `http://localhost:${this.proxyPort}`;
+      // Older Claude Code turns MCP tool search off for a custom base URL and
+      // sends every tool definition up front, enough to overflow the context.
+      env.ENABLE_TOOL_SEARCH = process.env.ENABLE_TOOL_SEARCH ?? "true";
     }
     // The launcher picks the Claude account from the folder, exports its
     // token, and execs CLAUDE_BIN, so the token never sits on this command line.
