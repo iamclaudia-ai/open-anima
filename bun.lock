@@ -6,8 +6,8 @@
       "name": "anima",
       "dependencies": {
         "@anthropic-ai/claude-agent-sdk": "catalog:",
-        "dockview": "5.1.0",
-        "dockview-react": "5.1.0",
+        "dockview": "8.9.1",
+        "dockview-react": "8.9.1",
         "fuzzysort": "4.0.2",
         "react": "catalog:",
         "react-dom": "catalog:",
@@ -950,11 +950,11 @@
 
     "devlop": ["devlop@1.1.0", "", { "dependencies": { "dequal": "^2.0.0" } }, "sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA=="],
 
-    "dockview": ["dockview@5.1.0", "", { "dependencies": { "dockview-core": "^5.1.0" }, "peerDependencies": { "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0" } }, "sha512-ej/RvP0r8a5qVHa7U7f2D1JsxomxVFHJs4kbYWTfVBsUFvLmBu+WbjnerDLKV7K6ex76dKR8Kt54L5MAgxiu6A=="],
+    "dockview": ["dockview@8.9.1", "", { "dependencies": { "dockview-core": "^8.9.1" } }, "sha512-y35BxYANBtHJ4q7AIkd2c1Oh2pPx3dsaMhm6s4YvMXyIWlklxHRZupXtN6bS8QuJ/hmy/5ih/Ow2oARbEx4Yog=="],
 
-    "dockview-core": ["dockview-core@5.2.0", "", {}, "sha512-Gib8yhK2Ng7w47ASvbUZ7GdhBYbeXEflbIDxf/vobdQBMrN/QXmPaouSsSSkEx5YH0N8ap8GYljfvqjug7h5Fg=="],
+    "dockview-core": ["dockview-core@8.9.1", "", {}, "sha512-OzqB63P65qeSquFoyYjQi5yT85ERcmceaJ0+YdQL68IZJmBd5kAfe4UD9bl3xILuXJ1tlXIoExdZ+vLpv30u1g=="],
 
-    "dockview-react": ["dockview-react@5.1.0", "", { "dependencies": { "dockview": "^5.1.0" } }, "sha512-4rG7LNrKnq7YOlZyBGfUt9pAAu7XJIdpNm+4153k1e1xbXoX/smDl4W7sf8roBsZIEpEnVJJViypTH93fVVEBw=="],
+    "dockview-react": ["dockview-react@8.9.1", "", { "dependencies": { "dockview": "^8.9.1" }, "peerDependencies": { "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0", "react-dom": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0" } }, "sha512-xH63jytJwoLPNhK1XohVAQ3RnoWu+wh8U5ISlHQpxQ/jWxS94HuPMDB2JZbszfJ2ziBRafG1XHzrDlyvhIOdCw=="],
 
     "dot-prop": ["dot-prop@10.2.0", "", { "dependencies": { "type-fest": "^5.0.0" } }, "sha512-BTJ9aZYL3vCfZlZOBLy9v8TUqWGQ0pzFnygKwFZt5udj6viBoFIBviKPUoZLDCPn1FoXffv6McQFDenrm5Krfw=="],
 
